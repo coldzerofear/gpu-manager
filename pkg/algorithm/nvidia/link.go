@@ -18,7 +18,11 @@
 package nvidia
 
 import (
+	"fmt"
+	v1 "k8s.io/api/core/v1"
 	"sort"
+	"tkestack.io/gpu-manager/pkg/types"
+	"tkestack.io/gpu-manager/pkg/utils"
 
 	"k8s.io/klog"
 
@@ -33,19 +37,33 @@ type linkMode struct {
 //
 //Evaluate() of linkMode returns nodes with minimum connection overhead
 //of each other.
+
+// linkMode的Evaluate（）返回彼此连接开销最小的节点。
 func NewLinkMode(t *nvidia.NvidiaTree) *linkMode {
 	return &linkMode{t}
 }
 
-func (al *linkMode) Evaluate(cores int64, memory int64) []*nvidia.NvidiaNode {
+func (al *linkMode) Evaluate(cores int64, memory int64, pod *v1.Pod) []*nvidia.NvidiaNode {
 	var (
-		sorter   = linkSort(nvidia.ByType, nvidia.ByAvailable, nvidia.ByAllocatableMemory, nvidia.ByPids, nvidia.ByMinorID)
+		sorter = linkSort(
+			// 基于拓扑等级排序，从小到大，期望找到距离最近的显卡设备
+			nvidia.ByType,
+			//
+			nvidia.ByAvailable,
+			// 根据可分配内存从小到大排序
+			nvidia.ByAllocatableMemory,
+			// 根据节点上运行的PID长度比较两个NvidiaNode
+			nvidia.ByPids,
+			// 更具设备index排序，从小到大
+			nvidia.ByMinorID,
+		)
 		tmpStore = make(map[int]*nvidia.NvidiaNode)
 		root     = al.tree.Root()
 		nodes    = make([]*nvidia.NvidiaNode, 0)
 		num      = int(cores / nvidia.HundredCore)
 	)
 
+	// 遍历叶子节点
 	for _, node := range al.tree.Leaves() {
 		for node != root {
 			klog.V(2).Infof("Test %d mask %b", node.Meta.ID, node.Mask)
@@ -71,13 +89,20 @@ func (al *linkMode) Evaluate(cores int64, memory int64) []*nvidia.NvidiaNode {
 
 	sorter.Sort(candidates)
 
-	for _, n := range candidates[0].GetAvailableLeaves() {
+	for _, node := range candidates[0].GetAvailableLeaves() {
 		if num == 0 {
 			break
 		}
 
-		klog.V(2).Infof("Pick up %d mask %b", n.Meta.ID, n.Mask)
-		nodes = append(nodes, n)
+		// TODO 添加设备类型指定功能
+		if !utils.CheckDeviceType(pod.Annotations, node.Meta.Name) {
+			klog.V(2).Infof("current gpu device %d name %s non compliant annotation[%s], skip device",
+				node.Meta.MinorID, node.Meta.Name, fmt.Sprintf("%s or %s", types.PodAnnotationUseGpuType, types.PodAnnotationUnUseGpuType))
+			continue
+		}
+
+		klog.V(2).Infof("Pick up %d mask %b", node.Meta.ID, node.Mask)
+		nodes = append(nodes, node)
 		num--
 	}
 

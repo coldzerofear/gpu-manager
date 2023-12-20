@@ -95,6 +95,11 @@ func (vr *vcoreResourceServer) ListAndWatch(e *pluginapi.Empty, s pluginapi.Devi
 	return vr.mgr.ListAndWatchWithResourceName(types.VCoreAnnotation, e, s)
 }
 
+func (vr *vcoreResourceServer) GetPreferredAllocation(ctx context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	klog.V(2).Infof("GetPreferredAllocation request for vcore")
+	return vr.mgr.GetPreferredAllocation(ctx, req)
+}
+
 func (vr *vcoreResourceServer) GetDevicePluginOptions(ctx context.Context, e *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	klog.V(2).Infof("GetDevicePluginOptions request for vcore")
 	return vr.mgr.GetDevicePluginOptions(ctx, e)

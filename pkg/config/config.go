@@ -43,10 +43,21 @@ type Config struct {
 	CgroupDriver             string
 	RequestTimeout           time.Duration
 
+	DeviceMemoryScaling float64
+
 	VCudaRequestsQueue chan *types.VCudaRequest
 }
 
-//ExtraConfig contains extra options other than Config
+type NodeConfigs struct {
+	NodeConfig []struct {
+		Name                     string  `json:"name"`
+		ContainerRuntimeEndpoint string  `json:"containerRuntimeEndpoint,omitempty"`
+		CgroupDriver             string  `json:"cgroupDriver,omitempty"`
+		DeviceMemoryScaling      float64 `json:"deviceMemoryScaling,omitempty"`
+	} `json:"nodeConfig"`
+}
+
+// ExtraConfig contains extra options other than Config
 type ExtraConfig struct {
 	Devices []string `json:"devices,omitempty"`
 }

@@ -18,10 +18,11 @@
 package nvidia
 
 import (
+	v1 "k8s.io/api/core/v1"
 	node "tkestack.io/gpu-manager/pkg/device/nvidia"
 )
 
-//Evaluator api for schedule algorithm
+// Evaluator api for schedule algorithm
 type Evaluator interface {
-	Evaluate(cores int64, memory int64) []*node.NvidiaNode
+	Evaluate(cores int64, memory int64, pod *v1.Pod) []*node.NvidiaNode
 }

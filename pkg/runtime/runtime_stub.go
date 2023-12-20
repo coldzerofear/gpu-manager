@@ -1,7 +1,7 @@
 package runtime
 
 import (
-	criapi "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
+	criapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
 type containerRuntimeManagerStub struct {
@@ -13,7 +13,11 @@ func NewContainerRuntimeManagerStub() *containerRuntimeManagerStub {
 	return &containerRuntimeManagerStub{}
 }
 
-func (m *containerRuntimeManagerStub) GetPidsInContainers(containerID string) ([]int, error) {
+func (m *containerRuntimeManagerStub) GetPidsInContainerById(containerID string) ([]int, error) {
+	return nil, nil
+}
+
+func (m *containerRuntimeManagerStub) GetPidsInContainerByStatus(containerStatus *criapi.ContainerStatus) ([]int, error) {
 	return nil, nil
 }
 

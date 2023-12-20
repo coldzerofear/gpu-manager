@@ -93,6 +93,7 @@ func Open() (*LDCache, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 文件内存映射
 	d, err := syscall.Mmap(int(f.Fd()), 0, int(fi.Size()),
 		syscall.PROT_READ, syscall.MAP_PRIVATE)
 	if err != nil {
@@ -104,6 +105,7 @@ func Open() (*LDCache, error) {
 }
 
 func (c *LDCache) Close() error {
+	// 释放内存
 	return syscall.Munmap(c.data)
 }
 

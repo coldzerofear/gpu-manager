@@ -18,6 +18,7 @@
 package watchdog
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"testing"
@@ -64,7 +65,7 @@ func TestWatchdog(t *testing.T) {
 		}},
 		Status: v1.PodStatus{Phase: v1.PodRunning},
 	}
-	k8sclient.CoreV1().Pods(ns).Create(pod)
+	k8sclient.CoreV1().Pods(ns).Create(context.Background(), pod, metav1.CreateOptions{})
 
 	// create watchdog and run
 	NewPodCacheForTest(k8sclient)

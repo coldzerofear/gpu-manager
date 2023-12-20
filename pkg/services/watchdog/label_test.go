@@ -18,6 +18,7 @@
 package watchdog
 
 import (
+	"context"
 	"flag"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestNodeLabeler(t *testing.T) {
 			Labels: make(map[string]string),
 		},
 	}
-	k8sclient.CoreV1().Nodes().Create(node)
+	k8sclient.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
 
 	// create nodeLabeler and run
 	nodeLabeler := NewNodeLabeler(k8sclient.CoreV1(), nodeName, labels)
@@ -57,7 +58,7 @@ func TestNodeLabeler(t *testing.T) {
 
 	// check if nodeLabeler work well
 	err := wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
-		node, err := k8sclient.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
+		node, err := k8sclient.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}

@@ -18,6 +18,10 @@ proto:
 img:
 	hack/build.sh "img"
 
+.PHONY: img-arm
+img-arm:
+	hack/build-arm.sh "img"
+
 .PHONY: fmt
 fmt:
 	hack/build.sh "fmt"

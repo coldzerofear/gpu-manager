@@ -71,7 +71,7 @@ type managerImpl struct {
 	srv          *grpc.Server
 }
 
-//NewManager creates and returns a new managerImpl struct
+// NewManager creates and returns a new managerImpl struct
 func NewManager(cfg *config.Config) Manager {
 	manager := &managerImpl{
 		config:       cfg,
@@ -101,6 +101,7 @@ func (m *managerImpl) Ready() bool {
 
 // #lizard forgives
 func (m *managerImpl) Run() error {
+	// 校验配置文件
 	if err := m.validExtraConfig(m.config.ExtraConfigPath); err != nil {
 		klog.Errorf("Can not load extra config, err %s", err)
 
@@ -159,13 +160,20 @@ func (m *managerImpl) Run() error {
 	watchdog.NewPodCache(client, m.config.Hostname)
 	klog.V(2).Infof("Watchdog is running")
 
+	// TODO 检测更新节点label
 	labeler := watchdog.NewNodeLabeler(client.CoreV1(), m.config.Hostname, m.config.NodeLabels)
 	if err := labeler.Run(); err != nil {
+		return err
+	}
+	// TODO 更新节点注释 更新节点心跳
+	annotator := watchdog.NewNodeAnnotator(client.CoreV1(), m.config)
+	if err := annotator.Run(); err != nil {
 		return err
 	}
 
 	klog.V(2).Infof("Load container response data")
 	responseManager := response.NewResponseManager()
+	// 加载device manager 数据
 	if err := responseManager.LoadFromFile(m.config.DevicePluginPath); err != nil {
 		klog.Errorf("can't load container response data, %+#v", err)
 		return err
@@ -299,6 +307,10 @@ func (m *managerImpl) ListAndWatchWithResourceName(resourceName string, e *plugi
 	return m.allocator.ListAndWatchWithResourceName(resourceName, e, s)
 }
 
+func (m *managerImpl) GetPreferredAllocation(ctx context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	return m.allocator.GetPreferredAllocation(ctx, req)
+}
+
 func (m *managerImpl) GetDevicePluginOptions(ctx context.Context, e *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	return m.allocator.GetDevicePluginOptions(ctx, e)
 }
@@ -331,7 +343,7 @@ func (m *managerImpl) RegisterToKubelet() error {
 	defer conn.Close()
 
 	client := pluginapi.NewRegistrationClient(conn)
-
+	// 遍历出 vcuda-core、vcuda-memory
 	for _, srv := range m.bundleServer {
 		req := &pluginapi.RegisterRequest{
 			Version:      pluginapi.Version,
@@ -341,6 +353,7 @@ func (m *managerImpl) RegisterToKubelet() error {
 		}
 
 		klog.V(2).Infof("Register to kubelet with endpoint %s", req.Endpoint)
+		// 将资源信息注册到kubelet
 		_, err = client.Register(context.Background(), req)
 		if err != nil {
 			return err

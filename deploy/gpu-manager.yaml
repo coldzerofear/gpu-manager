@@ -1,3 +1,22 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-manager
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gpu-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: gpu-manager
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -24,7 +43,7 @@ spec:
         # See https://kubernetes.io/docs/tasks/administer-cluster/guaranteed-scheduling-critical-addon-pods/
         - key: CriticalAddonsOnly
           operator: Exists
-        - key: tencent.com/vcuda-core
+        - key: nvidia.com/vcuda-core
           operator: Exists
           effect: NoSchedule
       # Mark this pod as a critical add-on; when enabled, the critical add-on
@@ -37,7 +56,7 @@ spec:
         nvidia-device-enable: enable
       hostPID: true
       containers:
-        - image: tkestack/gpu-manager:1.0.3
+        - image: registry.tydic.com/dcloud/gpu-manager:latest
           imagePullPolicy: Always
           name: gpu-manager
           securityContext:
@@ -45,12 +64,16 @@ spec:
           ports:
             - containerPort: 5678
           volumeMounts:
+            - name: kubelet-path
+              mountPath: /var/lib/kubelet
             - name: device-plugin
               mountPath: /var/lib/kubelet/device-plugins
             - name: vdriver
               mountPath: /etc/gpu-manager/vdriver
             - name: vmdata
               mountPath: /etc/gpu-manager/vm
+            - name: device-config
+              mountPath: /etc/gpu-manager/config
             - name: log
               mountPath: /var/log/gpu-manager
             - name: checkpoint
@@ -65,14 +88,21 @@ spec:
               readOnly: true
           env:
             - name: LOG_LEVEL
-              value: "4"
+              value: "5"
             - name: EXTRA_FLAGS
-              value: "--logtostderr=false"
+              value: "--logtostderr=true --node-labels=gaia.nvidia.com/gpu-model= --cgroup-driver=systemd"
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
       volumes:
+        - name: device-config
+          configMap:
+            name: gpu-manager-config
+        - name: kubelet-path
+          hostPath:
+            type: Directory
+            path: /var/lib/kubelet
         - name: device-plugin
           hostPath:
             type: Directory

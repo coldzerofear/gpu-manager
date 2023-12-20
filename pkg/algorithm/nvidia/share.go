@@ -18,7 +18,13 @@
 package nvidia
 
 import (
+	"fmt"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"sort"
+	"tkestack.io/gpu-manager/pkg/config"
+	"tkestack.io/gpu-manager/pkg/types"
+	"tkestack.io/gpu-manager/pkg/utils"
 
 	"k8s.io/klog"
 
@@ -26,7 +32,9 @@ import (
 )
 
 type shareMode struct {
-	tree *nvidia.NvidiaTree
+	tree   *nvidia.NvidiaTree
+	client kubernetes.Interface
+	config *config.Config
 }
 
 //NewShareMode returns a new shareMode struct.
@@ -36,25 +44,50 @@ type shareMode struct {
 //
 //Share mode means multiple application may share one GPU node which uses
 //GPU more efficiently.
-func NewShareMode(t *nvidia.NvidiaTree) *shareMode {
-	return &shareMode{t}
+
+// shareMode的Evaluate（）返回一个具有最小可用内核的节点，以完成请求。
+// shareMode 意味着多个应用程序可以共享一个GPU节点，从而更有效地使用GPU。
+func NewShareMode(t *nvidia.NvidiaTree, k8sClient kubernetes.Interface, config *config.Config) *shareMode {
+	return &shareMode{t, k8sClient, config}
 }
 
-func (al *shareMode) Evaluate(cores int64, memory int64) []*nvidia.NvidiaNode {
+func (al *shareMode) Evaluate(cores int64, memory int64, pod *v1.Pod) []*nvidia.NvidiaNode {
 	var (
 		nodes    []*nvidia.NvidiaNode
 		tmpStore = make([]*nvidia.NvidiaNode, al.tree.Total())
-		sorter   = shareModeSort(nvidia.ByAllocatableCores, nvidia.ByAllocatableMemory, nvidia.ByPids, nvidia.ByMinorID)
+		sorter   = shareModeSort(
+			// 按可分配核心数
+			nvidia.ByAllocatableCores,
+			// 按可分配显存
+			nvidia.ByAllocatableMemory,
+			// 按pid
+			nvidia.ByPids,
+			// 按设备index
+			nvidia.ByMinorID)
 	)
 
 	for i := 0; i < al.tree.Total(); i++ {
 		tmpStore[i] = al.tree.Leaves()[i]
 	}
-
+	// 节点排序
 	sorter.Sort(tmpStore)
 
 	for _, node := range tmpStore {
+		// 当可用核心、显存 大于等于请求
 		if node.AllocatableMeta.Cores >= cores && node.AllocatableMeta.Memory >= memory {
+			// TODO 排除掉开启了mig的设备
+			if nvidia.IsMig(node.Meta.ID) {
+				klog.V(2).Infof("current gpu device %d enabled mig mode", node.Meta.ID)
+				continue
+			}
+
+			// TODO 添加设备类型指定功能
+			if !utils.CheckDeviceType(pod.Annotations, node.Meta.Name) {
+				klog.V(2).Infof("current gpu device %d name %s non compliant annotation[%s], skip device",
+					node.Meta.MinorID, node.Meta.Name, fmt.Sprintf("%s or %s", types.PodAnnotationUseGpuType, types.PodAnnotationUnUseGpuType))
+				continue
+			}
+
 			klog.V(2).Infof("Pick up %d mask %b, cores: %d, memory: %d", node.Meta.ID, node.Mask, node.AllocatableMeta.Cores, node.AllocatableMeta.Memory)
 			nodes = append(nodes, node)
 			break

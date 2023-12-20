@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-manager-config
+  namespace: kube-system
+data:
+  config.json: |
+    {
+        "nodeConfig": [
+            {
+                "name": "demo-example",
+                "deviceMemoryScaling": 1,
+                "containerRuntimeEndpoint": "/var/run/containerd/containerd.sock",
+                "cgroupDriver": "systemd"
+            }
+        ]
+    }

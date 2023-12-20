@@ -109,7 +109,7 @@ func (k *kubeletStub) start() error {
 	return utils.WaitForServer(k.socket)
 }
 
-//stop servers and clean up
+// stop servers and clean up
 func stopServer(srv *managerImpl) {
 	for _, s := range srv.bundleServer {
 		s.Stop()
@@ -263,7 +263,7 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 		for i := range pod.Spec.Containers {
 			pod.Annotations[types.PredicateGPUIndexPrefix+strconv.Itoa(i)] = "0"
 		}
-		pod, _ = k8sClient.CoreV1().Pods("test-ns").Create(pod)
+		pod, _ = k8sClient.CoreV1().Pods("test-ns").Create(context.TODO(), pod, metav1.CreateOptions{})
 
 		// wait for podLister to sync
 		time.Sleep(time.Second * 2)

@@ -43,7 +43,35 @@ import (
 	"k8s.io/klog"
 )
 
-//constants used in this package
+type metadata struct {
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+}
+type patchLabel struct {
+	Metadata metadata `json:"metadata"`
+}
+
+func NewPatchLabel(labels map[string]string) patchLabel {
+	return patchLabel{
+		Metadata: metadata{
+			Labels: labels,
+		},
+	}
+}
+
+type patchAnnotation struct {
+	Metadata metadata `json:"metadata"`
+}
+
+func NewPatchAnnotation(annotation map[string]string) patchAnnotation {
+	return patchAnnotation{
+		Metadata: metadata{
+			Annotations: annotation,
+		},
+	}
+}
+
+// constants used in this package
 const (
 	TruncateLen = 31
 	kubePrefix  = "k8s"
@@ -54,17 +82,17 @@ var (
 	DefaultDialOptions = []grpc.DialOption{grpc.WithInsecure(), grpc.WithDialer(UnixDial), grpc.WithBlock()}
 )
 
-//UnixDial dials to a unix socket using net.DialTimeout
+// UnixDial dials to a unix socket using net.DialTimeout
 func UnixDial(addr string, timeout time.Duration) (net.Conn, error) {
 	return net.DialTimeout("unix", addr, timeout)
 }
 
-//IsValidGPUPath checks if path is valid Nvidia GPU device path
+// IsValidGPUPath checks if path is valid Nvidia GPU device path
 func IsValidGPUPath(path string) bool {
 	return regexp.MustCompile(types.NvidiaFullpathRE).MatchString(path)
 }
 
-//GetGPUMinorID returns id in Nvidia GPU device path
+// GetGPUMinorID returns id in Nvidia GPU device path
 func GetGPUMinorID(path string) (int, error) {
 	str := regexp.MustCompile(types.NvidiaFullpathRE).FindStringSubmatch(path)
 
@@ -77,15 +105,18 @@ func GetGPUMinorID(path string) (int, error) {
 	return int(id), nil
 }
 
-//GetGPUData get cores, memory and device names from annotations
+// GetGPUData get cores, memory and device names from annotations
 func GetGPUData(annotations map[string]string) (gpuUtil int64, gpuMemory int64, deviceNames []string) {
 	for k, v := range annotations {
 		switch {
 		case strings.HasSuffix(k, types.VCoreAnnotation):
+			//在设备插件分配阶段写入 示例：100
 			gpuUtil, _ = strconv.ParseInt(v, 10, 64)
 		case strings.HasSuffix(k, types.VMemoryAnnotation):
+			//在设备插件分配阶段写入 示例：3000
 			gpuMemory, _ = strconv.ParseInt(v, 10, 64)
 		case strings.HasSuffix(k, types.VDeviceAnnotation):
+			//在设备插件分配阶段写入 示例： /dev/nvidia0,/dev/nvidia1
 			deviceNames = strings.Split(annotations[k], ",")
 		}
 	}
@@ -93,7 +124,7 @@ func GetGPUData(annotations map[string]string) (gpuUtil int64, gpuMemory int64, 
 	return gpuUtil, gpuMemory, deviceNames
 }
 
-//NewFSWatcher returns a file watcher created by fsnotify.NewWatcher
+// NewFSWatcher returns a file watcher created by fsnotify.NewWatcher
 func NewFSWatcher(files ...string) (*fsnotify.Watcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -130,10 +161,11 @@ func GetCheckpointData(devicePluginPath string) (*types.Checkpoint, error) {
 	}
 	klog.V(4).Infof("Try NUMA checkpoint data format")
 	cpNUMAData := &types.CheckpointDataNUMA{}
-	err = json.Unmarshal(data, cpNUMAData)
-	if err != nil {
+	if err = json.Unmarshal(data, cpNUMAData); err != nil {
 		klog.V(4).Infof("Failed NUMA checkpoint data format")
-	} else { // flat deviceids
+	} else {
+		// CheckpointDataNUMA 反序列化成功
+		// 当前以 CheckpointDataNUMA 格式反序列化并装填 Checkpoint v1对象
 		v2DeivcesEntryies := make([]types.PodDevicesEntry, len(cpNUMAData.Data.PodDeviceEntries))
 		for i, v := range cpNUMAData.Data.PodDeviceEntries {
 			v2PodDevicesEntry := types.PodDevicesEntry{
@@ -153,25 +185,21 @@ func GetCheckpointData(devicePluginPath string) (*types.Checkpoint, error) {
 		cpV1Data.PodDeviceEntries = v2DeivcesEntryies
 		return cpV1Data, nil
 	}
-
+	// 尝试使用checkpoint v2格式反序列化对象
 	klog.V(4).Infof("Try v2 checkpoint data format")
 	cpV2Data := &types.CheckpointData{}
-	err = json.Unmarshal(data, cpV2Data)
-	if err != nil {
+	if err = json.Unmarshal(data, cpV2Data); err != nil {
 		return nil, err
 	}
-
 	if cpV2Data.Data != nil {
 		return cpV2Data.Data, nil
 	}
-
+	// 尝试使用v1格式反序列化对象
 	klog.V(4).Infof("Try v1 checkpoint data format")
 	cpV1Data := &types.Checkpoint{}
-	err = json.Unmarshal(data, cpV1Data)
-	if err != nil {
+	if err = json.Unmarshal(data, cpV1Data); err != nil {
 		return nil, err
 	}
-
 	return cpV1Data, nil
 }
 
@@ -187,6 +215,37 @@ func IsStringSliceEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TODO 校验设备名称是否符合条件
+func CheckDeviceType(annotations map[string]string, deviceType string) bool {
+	deviceType = strings.ToUpper(deviceType)
+	if use, ok1 := annotations[types.PodAnnotationUseGpuType]; ok1 {
+		useTypes := strings.Split(use, ",")
+		if !ContainsSliceFunc(useTypes, func(useType string) bool {
+			return strings.Contains(deviceType, strings.ToUpper(useType))
+		}) {
+			return false
+		}
+	}
+	if unuse, ok2 := annotations[types.PodAnnotationUnUseGpuType]; ok2 {
+		unuseTypes := strings.Split(unuse, ",")
+		if ContainsSliceFunc(unuseTypes, func(unuseType string) bool {
+			return strings.Contains(deviceType, strings.ToUpper(unuseType))
+		}) {
+			return false
+		}
+	}
+	return true
+}
+
+func ContainsSliceFunc[S ~[]E, E any](s S, filter func(E) bool) bool {
+	for _, e := range s {
+		if filter(e) {
+			return true
+		}
+	}
+	return false
 }
 
 func ShouldRetry(err error) bool {
@@ -304,21 +363,37 @@ func IsGPUAssignedPod(pod *v1.Pod) bool {
 	return true
 }
 
-func GetPredicateTimeOfPod(pod *v1.Pod) (predicateTime uint64) {
-	if predicateTimeStr, ok := pod.ObjectMeta.Annotations[types.PredicateTimeAnnotation]; ok {
-		u64, err := strconv.ParseUint(predicateTimeStr, 10, 64)
+func GetBindTimeOfPod(pod *v1.Pod) (bindTime uint64) {
+	if bindTimeStr, ok := pod.ObjectMeta.Labels[types.PodLabelBindTime]; ok {
+		u64, err := strconv.ParseUint(bindTimeStr, 10, 64)
 		if err != nil {
-			klog.Warningf("Failed to parse predicate Timestamp %s due to %v", predicateTimeStr, err)
+			klog.Warningf("Failed to parse predicate Timestamp %s due to %v", bindTimeStr, err)
 		} else {
-			predicateTime = u64
+			bindTime = u64
 		}
 	} else {
 		// If predicate time not found, use createionTimestamp instead
-		predicateTime = uint64(pod.ObjectMeta.CreationTimestamp.UnixNano())
+		bindTime = uint64(pod.ObjectMeta.CreationTimestamp.UnixNano())
 	}
 
-	return predicateTime
+	return bindTime
 }
+
+//func GetPredicateTimeOfPod(pod *v1.Pod) (predicateTime uint64) {
+//	if predicateTimeStr, ok := pod.ObjectMeta.Annotations[types.PredicateTimeAnnotation]; ok {
+//		u64, err := strconv.ParseUint(predicateTimeStr, 10, 64)
+//		if err != nil {
+//			klog.Warningf("Failed to parse predicate Timestamp %s due to %v", predicateTimeStr, err)
+//		} else {
+//			predicateTime = u64
+//		}
+//	} else {
+//		// If predicate time not found, use createionTimestamp instead
+//		predicateTime = uint64(pod.ObjectMeta.CreationTimestamp.UnixNano())
+//	}
+//
+//	return predicateTime
+//}
 
 func GetGPUResourceOfContainer(container *v1.Container, resourceName v1.ResourceName) uint {
 	var count uint
@@ -351,4 +426,12 @@ func GetVirtualControllerMountPath(resp *pluginapi.ContainerAllocateResponse) st
 	}
 
 	return ""
+}
+
+func B2S(bs []int8) string {
+	b := make([]byte, len(bs))
+	for i, v := range bs {
+		b[i] = byte(v)
+	}
+	return string(b)
 }

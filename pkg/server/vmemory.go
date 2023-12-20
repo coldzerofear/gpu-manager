@@ -92,11 +92,18 @@ func (vr *vmemoryResourceServer) Allocate(ctx context.Context, reqs *pluginapi.A
 	return &pluginapi.AllocateResponse{
 		ContainerResponses: fakeData,
 	}, nil
+
+	// return vr.mgr.Allocate(ctx, reqs)
 }
 
 func (vr *vmemoryResourceServer) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 	klog.V(2).Infof("ListAndWatch request for vmemory")
 	return vr.mgr.ListAndWatchWithResourceName(types.VMemoryAnnotation, e, s)
+}
+
+func (vr *vmemoryResourceServer) GetPreferredAllocation(ctx context.Context, req *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	klog.V(2).Infof("GetPreferredAllocation request for vmemory")
+	return vr.mgr.GetPreferredAllocation(ctx, req)
 }
 
 func (vr *vmemoryResourceServer) GetDevicePluginOptions(ctx context.Context, e *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {

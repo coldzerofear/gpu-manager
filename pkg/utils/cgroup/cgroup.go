@@ -52,13 +52,27 @@ func (cgroupName CgroupName) ToSystemd() string {
 		part = escapeSystemdCgroupName(part)
 		newparts = append(newparts, part)
 	}
-
 	result, err := cgroupsystemd.ExpandSlice(strings.Join(newparts, "-") + systemdSuffix)
 	if err != nil {
 		// Should never happen...
 		panic(fmt.Errorf("error converting cgroup name [%v] to systemd format: %v", cgroupName, err))
 	}
 	return result
+}
+
+// For example, the name {"kubepods", "burstable", "pod1234-abcd-5678-efgh"} becomes
+// "kubepods-burstable-pod1234_abcd_5678_efgh.slice"
+func (cgroupName CgroupName) ToSystemd2() string {
+	if len(cgroupName) == 0 || (len(cgroupName) == 1 && cgroupName[0] == "") {
+		return "/"
+	}
+	newparts := []string{}
+	for _, part := range cgroupName {
+		// 替换 - 为 _
+		part = escapeSystemdCgroupName(part)
+		newparts = append(newparts, part)
+	}
+	return strings.Join(newparts, "-") + systemdSuffix
 }
 
 func escapeSystemdCgroupName(part string) string {

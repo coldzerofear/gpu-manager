@@ -23,16 +23,16 @@ import (
 
 	"k8s.io/klog"
 
-	"tkestack.io/nvml"
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 )
 
-//SchedulerCache contains allocatable resource of GPU
+// SchedulerCache contains allocatable resource of GPU
 type SchedulerCache struct {
 	Cores  int64
 	Memory int64
 }
 
-//DeviceMeta contains metadata of GPU device
+// DeviceMeta contains metadata of GPU device
 type DeviceMeta struct {
 	ID          int
 	MinorID     int
@@ -41,10 +41,11 @@ type DeviceMeta struct {
 	Pids        []uint
 	BusId       string
 	Utilization uint
+	Name        string
 	UUID        string
 }
 
-//NvidiaNode represents a node of Nvidia GPU
+// NvidiaNode represents a node of Nvidia GPU
 type NvidiaNode struct {
 	Meta            DeviceMeta
 	AllocatableMeta SchedulerCache
@@ -64,11 +65,11 @@ var (
 	nodeIndex = 0
 )
 
-//NewNvidiaNode returns a new NvidiaNode
+// NewNvidiaNode returns a new NvidiaNode
 func NewNvidiaNode(t *NvidiaTree) *NvidiaNode {
 	node := &NvidiaNode{
 		vchildren: make(map[int]*NvidiaNode),
-		ntype:     nvml.TOPOLOGY_UNKNOWN,
+		ntype:     60,
 		tree:      t,
 		Meta: DeviceMeta{
 			ID: nodeIndex,
@@ -85,18 +86,18 @@ func (n *NvidiaNode) setParent(p *NvidiaNode) {
 	p.vchildren[n.Meta.ID] = n
 }
 
-//MinorName returns MinorID of this NvidiaNode
+// MinorName returns MinorID of this NvidiaNode
 func (n *NvidiaNode) MinorName() string {
 	return fmt.Sprintf(NamePattern, n.Meta.MinorID)
 }
 
-//Type returns GpuTopologyLevel of this NvidiaNode
+// Type returns GpuTopologyLevel of this NvidiaNode
 func (n *NvidiaNode) Type() int {
 	return int(n.ntype)
 }
 
-//GetAvailableLeaves returns leaves of this NvidiaNode
-//which available for allocating.
+// GetAvailableLeaves returns leaves of this NvidiaNode
+// which available for allocating.
 func (n *NvidiaNode) GetAvailableLeaves() []*NvidiaNode {
 	var leaves []*NvidiaNode
 
@@ -112,8 +113,8 @@ func (n *NvidiaNode) GetAvailableLeaves() []*NvidiaNode {
 	return leaves
 }
 
-//Available returns conut of available leaves
-//of this NvidiaNode.
+// Available returns conut of available leaves
+// of this NvidiaNode.
 func (n *NvidiaNode) Available() int {
 	return bits.OnesCount32(n.Mask)
 }
@@ -128,8 +129,8 @@ func (n *NvidiaNode) String() string {
 		return "PXB"
 	case nvml.TOPOLOGY_HOSTBRIDGE:
 		return "PHB"
-	case nvml.TOPOLOGY_CPU:
-		return "CPU"
+	//case nvml.TOPOLOGY_CPU:
+	//	return "CPU"
 	case nvml.TOPOLOGY_SYSTEM:
 		return "SYS"
 	}

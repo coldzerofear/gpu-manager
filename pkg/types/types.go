@@ -22,19 +22,31 @@ import (
 )
 
 const (
-	VDeviceAnnotation       = "tencent.com/vcuda-device"
-	VCoreAnnotation         = "tencent.com/vcuda-core"
-	VCoreLimitAnnotation    = "tencent.com/vcuda-core-limit"
-	VMemoryAnnotation       = "tencent.com/vcuda-memory"
-	PredicateTimeAnnotation = "tencent.com/predicate-time"
-	PredicateGPUIndexPrefix = "tencent.com/predicate-gpu-idx-"
-	GPUAssigned             = "tencent.com/gpu-assigned"
+	VDeviceAnnotation       = "nvidia.com/vcuda-device"
+	VCoreAnnotation         = "nvidia.com/vcuda-core"
+	VCoreLimitAnnotation    = "nvidia.com/vcuda-core-limit"
+	VMemoryAnnotation       = "nvidia.com/vcuda-memory"
+	PredicateTimeAnnotation = "nvidia.com/predicate-time"
+	PredicateGPUIndexPrefix = "nvidia.com/predicate-gpu-idx-"
+	GPUAssigned             = "nvidia.com/gpu-assigned"
 	ClusterNameAnnotation   = "clusterName"
+
+	// TODO 作用于pod上指定要分配的设备类型 例如：A100
+	PodAnnotationUseGpuType = "nvidia.com/use-gputype"
+	// TODO 作用于pod上指定不要分配的设备类型 例如：3080
+	PodAnnotationUnUseGpuType = "nvidia.com/nouse-gputype"
+
+	// 节点绑定时间
+	PodLabelBindTime = "tydic.io/bind-time"
+	// 设备绑定阶段
+	PodLabelDeviceBindPhase = "tydic.io/bind-phase"
 
 	VCUDA_MOUNTPOINT = "/etc/vcuda"
 
 	/** 256MB */
-	MemoryBlockSize = 268435456
+	//MemoryBlockSize = 268435456
+	/** 1MB */
+	MemoryBlockSize = 1048576
 
 	KubeletSocket                 = "kubelet.sock"
 	VDeviceSocket                 = "vcuda.sock"
@@ -42,6 +54,14 @@ const (
 	PreStartContainerCheckErrMsg  = "PreStartContainer check failed"
 	PreStartContainerCheckErrType = "PreStartContainerCheckErr"
 	UnexpectedAdmissionErrType    = "UnexpectedAdmissionError"
+)
+
+type DeviceBindPhase string
+
+const (
+	DeviceBindAllocating DeviceBindPhase = "allocating"
+	DeviceBindFailed     DeviceBindPhase = "failed"
+	DeviceBindSuccess    DeviceBindPhase = "success"
 )
 
 const (
@@ -56,8 +76,9 @@ const (
 )
 
 const (
-	CGROUP_BASE  = "/sys/fs/cgroup/memory"
-	CGROUP_PROCS = "cgroup.procs"
+	CGROUP_BASE   = "/sys/fs/cgroup"
+	CGROUP_MEMORY = CGROUP_BASE + "/memory"
+	CGROUP_PROCS  = "cgroup.procs"
 )
 
 type VCudaRequest struct {

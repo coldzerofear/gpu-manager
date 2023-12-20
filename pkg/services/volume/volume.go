@@ -33,7 +33,7 @@ import (
 	"k8s.io/klog"
 )
 
-//VolumeManager manages volumes used by containers running GPU application
+// VolumeManager manages volumes used by containers running GPU application
 type VolumeManager struct {
 	Config  []Config `json:"volume,omitempty"`
 	cfgPath string
@@ -46,7 +46,7 @@ type VolumeManager struct {
 
 type components map[string][]string
 
-//Config contains volume details in config file
+// Config contains volume details in config file
 type Config struct {
 	Name       string     `json:"name,omitempty"`
 	Mode       string     `json:"mode,omitempty"`
@@ -65,16 +65,16 @@ type volumeDir struct {
 	files []string
 }
 
-//Volume contains directory and file info of volume
+// Volume contains directory and file info of volume
 type Volume struct {
 	Path string
 	dirs []volumeDir
 }
 
-//VolumeMap stores Volume for each type
+// VolumeMap stores Volume for each type
 type VolumeMap map[string]*Volume
 
-//NewVolumeManager returns a new VolumeManager
+// NewVolumeManager returns a new VolumeManager
 func NewVolumeManager(config string, share bool) (*VolumeManager, error) {
 	f, err := os.Open(config)
 	if err != nil {
@@ -97,7 +97,7 @@ func NewVolumeManager(config string, share bool) (*VolumeManager, error) {
 	return volumeManager, nil
 }
 
-//Run starts a VolumeManager
+// Run starts a VolumeManager
 func (vm *VolumeManager) Run() (err error) {
 	cache, err := ldcache.Open()
 	if err != nil {

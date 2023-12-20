@@ -19,6 +19,7 @@ package nvidia
 
 import (
 	"flag"
+	v1 "k8s.io/api/core/v1"
 	"testing"
 
 	"tkestack.io/gpu-manager/pkg/device/nvidia"
@@ -51,9 +52,11 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 		"/dev/nvidia1",
 		"/dev/nvidia2",
 	}
+	pod := v1.Pod{}
+	pod.Annotations = make(map[string]string)
 
 	cores := int64(3 * nvidia.HundredCore)
-	pass, should, but := examining(expectCase1, algo.Evaluate(cores, 0))
+	pass, should, but := examining(expectCase1, algo.Evaluate(cores, 0, &pod))
 	if !pass {
 		t.Fatalf("Evaluate function got wrong, should be %s, but %s", should, but)
 	}
@@ -70,7 +73,7 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 	}
 
 	cores = int64(2 * nvidia.HundredCore)
-	pass, should, but = examining(expectCase2, algo.Evaluate(cores, 0))
+	pass, should, but = examining(expectCase2, algo.Evaluate(cores, 0, &pod))
 	if !pass {
 		t.Fatalf("Evaluate function got wrong, should be %s, but %s", should, but)
 	}

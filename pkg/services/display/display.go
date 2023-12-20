@@ -20,6 +20,7 @@ package display
 import (
 	"context"
 	"fmt"
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"sort"
 	"strings"
 	"sync"
@@ -39,10 +40,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/api/core/v1"
 	"k8s.io/klog"
-	"tkestack.io/nvml"
 )
 
-//Display is used to show GPU device usage
+// Display is used to show GPU device usage
 type Display struct {
 	sync.Mutex
 
@@ -54,7 +54,7 @@ type Display struct {
 var _ displayapi.GPUDisplayServer = &Display{}
 var _ prometheus.Collector = &Display{}
 
-//NewDisplay returns a new Display
+// NewDisplay returns a new Display
 func NewDisplay(config *config.Config, tree device.GPUTree, runtimeManager runtime.ContainerRuntimeInterface) *Display {
 	_tree, _ := tree.(*nvtree.NvidiaTree)
 	return &Display{
@@ -64,8 +64,9 @@ func NewDisplay(config *config.Config, tree device.GPUTree, runtimeManager runti
 	}
 }
 
-//PrintGraph updates the tree and returns the result of tree.PrintGraph
+// PrintGraph updates the tree and returns the result of tree.PrintGraph
 func (disp *Display) PrintGraph(context.Context, *google_protobuf1.Empty) (*displayapi.GraphResponse, error) {
+	// 从GPU设备获取信息更新NvidiaTree。如果没有真正的GPU设备，则立即返回。
 	disp.tree.Update()
 
 	return &displayapi.GraphResponse{
@@ -73,11 +74,11 @@ func (disp *Display) PrintGraph(context.Context, *google_protobuf1.Empty) (*disp
 	}, nil
 }
 
-//PrintUsages returns usage info getting from docker and watchdog
+// PrintUsages returns usage info getting from docker and watchdog
 func (disp *Display) PrintUsages(context.Context, *google_protobuf1.Empty) (*displayapi.UsageResponse, error) {
 	disp.Lock()
 	defer disp.Unlock()
-
+	// 获取使用了gpu的活动中的pod
 	activePods := watchdog.GetActivePods()
 	displayResp := &displayapi.UsageResponse{
 		Usage: make(map[string]*displayapi.ContainerStat),
@@ -86,14 +87,18 @@ func (disp *Display) PrintUsages(context.Context, *google_protobuf1.Empty) (*dis
 	for _, pod := range activePods {
 		podUID := string(pod.UID)
 
+		// 计算当前pod的gpu利用率信息信息
 		podUsage := disp.getPodUsage(pod)
 		if len(podUsage) > 0 {
+			// 聚合信息
 			displayResp.Usage[podUID] = &displayapi.ContainerStat{
 				Cluster: pod.Annotations[types.ClusterNameAnnotation],
 				Project: pod.Namespace,
 				User:    getUserName(pod),
-				Stat:    podUsage,
-				Spec:    disp.getPodSpec(pod, podUsage),
+				// pod 实际使用率
+				Stat: podUsage,
+				// pod gpu分配信息
+				Spec: disp.getPodSpec(pod, podUsage),
 			}
 		}
 	}
@@ -114,10 +119,12 @@ func (disp *Display) getPodSpec(pod *v1.Pod, devicesInfo map[string]*displayapi.
 		memBytes := vmemory.Value() * types.MemoryBlockSize
 
 		spec := &displayapi.Spec{
+			// gpu数
 			Gpu: float32(vcore.Value()) / 100,
+			// 位运算bytes单位转换为mb
 			Mem: float32(memBytes >> 20),
 		}
-
+		// 当分配给容器的gpu mem经计算为0，则将整个卡的显存分配给pod
 		if memBytes == 0 {
 			var deviceMem int64
 			if dev, ok := devicesInfo[ctnt.Name]; ok {
@@ -147,11 +154,11 @@ func (disp *Display) getPodUsage(pod *v1.Pod) map[string]*displayapi.Devices {
 
 		containerInfo, err := disp.containerRuntimeManager.InspectContainer(contID)
 		if err != nil {
-			klog.Warningf("can't find %s from docker", contID)
+			klog.Warningf("can't find %s from %s, err: %v", contID, disp.containerRuntimeManager.RuntimeName(), err)
 			continue
 		}
 
-		pidsInContainer, err := disp.containerRuntimeManager.GetPidsInContainers(contID)
+		pidsInContainer, err := disp.containerRuntimeManager.GetPidsInContainerByStatus(containerInfo)
 		if err != nil {
 			klog.Errorf("can't get pids form container %s, %v", contID, err)
 			continue
@@ -161,7 +168,9 @@ func (disp *Display) getPodUsage(pod *v1.Pod) map[string]*displayapi.Devices {
 		for _, deviceName := range deviceNames {
 			if utils.IsValidGPUPath(deviceName) {
 				node := disp.tree.Query(deviceName)
+				// 获取pod进程在当前gpu设备上的设备利用率
 				if usage := disp.getDeviceUsage(pidsInContainer, node.Meta.ID); usage != nil {
+					// 内存单位bytes转为mb
 					usage.DeviceMem = float32(node.Meta.TotalMemory >> 20)
 					devicesUsage = append(devicesUsage, usage)
 				}
@@ -178,7 +187,7 @@ func (disp *Display) getPodUsage(pod *v1.Pod) map[string]*displayapi.Devices {
 	return podUsage
 }
 
-//Version returns version of GPU manager
+// Version returns version of GPU manager
 func (disp *Display) Version(context.Context, *google_protobuf1.Empty) (*displayapi.VersionResponse, error) {
 	resp := &displayapi.VersionResponse{
 		Version: version.Get().String(),
@@ -191,60 +200,68 @@ func (disp *Display) getDeviceUsage(pidsInCont []int, deviceIdx int) *displayapi
 	nvml.Init()
 	defer nvml.Shutdown()
 
-	dev, err := nvml.DeviceGetHandleByIndex(uint(deviceIdx))
-	if err != nil {
-		klog.Warningf("can't find device %d, error %s", deviceIdx, err)
+	// 更具设备index获取设备
+	dev, rs := nvml.DeviceGetHandleByIndex(deviceIdx)
+	if rs != nvml.SUCCESS {
+		klog.Warningf("can't find device %d, error %s", deviceIdx, nvml.ErrorString(rs))
 		return nil
 	}
-
-	processSamples, err := dev.DeviceGetProcessUtilization(1024, time.Second)
-	if err != nil {
-		klog.Warningf("can't get processes utilization from device %d, error %s", deviceIdx, err)
+	lastUtilizationTimestamp := uint64(time.Now().Add(-1 * time.Second).UnixMicro())
+	// 获取进程利用率
+	processSamples, rs := dev.GetProcessUtilization(lastUtilizationTimestamp)
+	if rs != nvml.SUCCESS {
+		klog.Warningf("can't get processes utilization from device %d, error %s", deviceIdx, nvml.ErrorString(rs))
 		return nil
 	}
-
-	processOnDevices, err := dev.DeviceGetComputeRunningProcesses(1024)
-	if err != nil {
-		klog.Warningf("can't get processes info from device %d, error %s", deviceIdx, err)
+	//获取正在当前设备上运行的进程
+	processOnDevices, rs := dev.GetComputeRunningProcesses()
+	if rs != nvml.SUCCESS {
+		klog.Warningf("can't get processes info from device %d, error %s", deviceIdx, nvml.ErrorString(rs))
 		return nil
 	}
-
-	busID, err := dev.DeviceGetPciInfo()
-	if err != nil {
-		klog.Warningf("can't get pci info from device %d, error %s", deviceIdx, err)
+	// 获取设备pci信息
+	pciInfo, rs := dev.GetPciInfo()
+	if rs != nvml.SUCCESS {
+		klog.Warningf("can't get pci info from device %d, error %s", deviceIdx, nvml.ErrorString(rs))
 		return nil
 	}
-
+	// 容器进程id排序，从小到大排序
 	sort.Slice(pidsInCont, func(i, j int) bool {
 		return pidsInCont[i] < pidsInCont[j]
 	})
-
+	// 已使用设备内存
 	usedMemory := uint64(0)
+	// 使用设备中的进程id
 	usedPids := make([]int32, 0)
-	usedGPU := uint(0)
+	// 使用的gpu利用率
+	usedGPU := uint32(0)
 	for _, info := range processOnDevices {
+		// 二分查找 找到进程在pidsInCont上的索引号
 		idx := sort.Search(len(pidsInCont), func(pivot int) bool {
 			return pidsInCont[pivot] >= int(info.Pid)
 		})
-
+		// 根据容器pid 找到当前容器在设备上的进程
 		if idx < len(pidsInCont) && pidsInCont[idx] == int(info.Pid) {
+			// 加入到已使用进程中
 			usedPids = append(usedPids, int32(pidsInCont[idx]))
-			usedMemory += info.UsedGPUMemory
+			// 加上该进程已使用的显存
+			usedMemory += info.UsedGpuMemory
 		}
 	}
 
 	for _, sample := range processSamples {
+		// 二分查找 找到进程在pidsInCont上的索引号
 		idx := sort.Search(len(pidsInCont), func(pivot int) bool {
 			return pidsInCont[pivot] >= int(sample.Pid)
 		})
-
+		// 根据容器pid 找到当前容器在设备上的进程
 		if idx < len(pidsInCont) && pidsInCont[idx] == int(sample.Pid) {
+			// 加上进程的利用率
 			usedGPU += sample.SmUtil
 		}
 	}
-
 	return &displayapi.DeviceInfo{
-		Id:      busID.BusID,
+		Id:      utils.B2S(pciInfo.BusId[:]),
 		CardIdx: fmt.Sprintf("%d", deviceIdx),
 		Gpu:     float32(usedGPU),
 		Mem:     float32(usedMemory >> 20),
@@ -268,7 +285,8 @@ type gpuMemoryDesc struct{}
 type gpuMemorySpecDesc struct{}
 
 var (
-	defaultMetricLabels   = []string{"pod_name", "namespace", "node", "container_name"}
+	//defaultMetricLabels   = []string{"pod_name", "namespace", "node", "container_name", "container_id", "container_pids"}
+	defaultMetricLabels   = []string{"pod_name", "namespace", "node", "container_name", "container_id"}
 	utilDescBuilder       = gpuUtilDesc{}
 	utilSpecDescBuilder   = gpuUtilSpecDesc{}
 	memoryDescBuilder     = gpuMemoryDesc{}
@@ -280,38 +298,38 @@ const (
 	metricNamespace
 	metricNodeName
 	metricContainerName
+	metricContainerId
+	//metricContainerPids
 )
-
-func (gpuUtilDesc) getDescribeDesc() *prometheus.Desc {
-	return prometheus.NewDesc("container_gpu_utilization", "gpu utilization", []string{"gpu"}, nil)
-}
-
-func (gpuUtilSpecDesc) getDescribeDesc() *prometheus.Desc {
-	return prometheus.NewDesc("container_request_gpu_utilization", "request of gpu utilization", []string{"req_of_gpu"}, nil)
-}
 
 func (gpuUtilDesc) getMetricDesc() *prometheus.Desc {
 	return prometheus.NewDesc("container_gpu_utilization", "gpu utilization", append(defaultMetricLabels, "gpu"), nil)
+}
+func (gpuUtilDesc) getDescribeDesc() *prometheus.Desc {
+	return prometheus.NewDesc("container_gpu_utilization", "gpu utilization", []string{"gpu"}, nil)
 }
 
 func (gpuUtilSpecDesc) getMetricDesc() *prometheus.Desc {
 	return prometheus.NewDesc("container_request_gpu_utilization", "request of gpu utilization", append(defaultMetricLabels, "req_of_gpu"), nil)
 }
+func (gpuUtilSpecDesc) getDescribeDesc() *prometheus.Desc {
+	return prometheus.NewDesc("container_request_gpu_utilization", "request of gpu utilization", []string{"req_of_gpu"}, nil)
+}
 
+// 容器的总gpu内存
+func (gpuMemoryDesc) getMetricDesc() *prometheus.Desc {
+	return prometheus.NewDesc("container_gpu_memory_total", "gpu memory usage in MiB", append(defaultMetricLabels, "gpu_memory"), nil)
+}
 func (gpuMemoryDesc) getDescribeDesc() *prometheus.Desc {
 	return prometheus.NewDesc("container_gpu_memory_total", "gpu memory usage in MiB", []string{"gpu_memory"}, nil)
 }
 
-func (gpuMemorySpecDesc) getDescribeDesc() *prometheus.Desc {
-	return prometheus.NewDesc("container_request_gpu_memory", "request of gpu memory in MiB", []string{"req_of_gpu_memory"}, nil)
-}
-
-func (gpuMemoryDesc) getMetricDesc() *prometheus.Desc {
-	return prometheus.NewDesc("container_gpu_memory_total", "gpu memory usage in MiB", append(defaultMetricLabels, "gpu_memory"), nil)
-}
-
+// 容器请求的gpu内存
 func (gpuMemorySpecDesc) getMetricDesc() *prometheus.Desc {
 	return prometheus.NewDesc("container_request_gpu_memory", "request of gpu memory in MiB", append(defaultMetricLabels, "req_of_gpu_memory"), nil)
+}
+func (gpuMemorySpecDesc) getDescribeDesc() *prometheus.Desc {
+	return prometheus.NewDesc("container_request_gpu_memory", "request of gpu memory in MiB", []string{"req_of_gpu_memory"}, nil)
 }
 
 // Describe implements prometheus Collector interface
@@ -324,6 +342,7 @@ func (disp *Display) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect implements prometheus Collector interface
 func (disp *Display) Collect(ch chan<- prometheus.Metric) {
+	// 遍历当前节点下所有的活动中的gpu pod
 	for _, pod := range watchdog.GetActivePods() {
 		valueLabels := make([]string, len(defaultMetricLabels))
 		valueLabels[metricPodName] = pod.Name
@@ -335,11 +354,14 @@ func (disp *Display) Collect(ch chan<- prometheus.Metric) {
 		// Usage of container
 		for contName, devicesStat := range podUsage {
 			valueLabels[metricContainerName] = contName
+			valueLabels[metricContainerId] = getContainerId(contName, pod.Status)
 
 			var totalUtils, totalMemory float32
 			for _, perDeviceStat := range devicesStat.Dev {
 				totalUtils += perDeviceStat.Gpu
 				totalMemory += perDeviceStat.Mem
+
+				//valueLabels[metricContainerPids] = getPids(perDeviceStat.Pids)
 
 				gpuID := fmt.Sprintf("gpu%s", perDeviceStat.CardIdx)
 				if perDeviceStat.Gpu >= 0 {
@@ -366,6 +388,7 @@ func (disp *Display) Collect(ch chan<- prometheus.Metric) {
 		// Spec of container
 		for contName, spec := range podSpec {
 			valueLabels[metricContainerName] = contName
+			valueLabels[metricContainerId] = getContainerId(contName, pod.Status)
 
 			ch <- prometheus.MustNewConstMetric(utilSpecDescBuilder.getMetricDesc(),
 				prometheus.GaugeValue, float64(spec.Gpu), append(valueLabels, "total")...)
@@ -373,4 +396,27 @@ func (disp *Display) Collect(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, float64(spec.Mem), append(valueLabels, "total")...)
 		}
 	}
+}
+
+func getPids(pids []int32) string {
+	pidstr := ""
+	for i, pid := range pids {
+		pidstr += fmt.Sprintf("%d", pid)
+		if i != len(pids)-1 {
+			pidstr += ","
+		}
+	}
+	return pidstr
+}
+
+func getContainerId(containerName string, podStatus v1.PodStatus) string {
+	for _, status := range podStatus.ContainerStatuses {
+		if status.Name == containerName {
+			if splits := strings.Split(status.ContainerID, "://"); len(splits) == 2 {
+				return splits[1]
+			}
+			break
+		}
+	}
+	return ""
 }

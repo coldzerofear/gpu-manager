@@ -20,17 +20,17 @@ package nvidia
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
-
 	"tkestack.io/gpu-manager/pkg/config"
 	"tkestack.io/gpu-manager/pkg/device"
 
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"k8s.io/klog"
-	"tkestack.io/nvml"
 )
 
 const (
@@ -44,10 +44,10 @@ const (
 	HundredCore = 100
 )
 
-//LevelMap is a map stores NvidiaNode on each level.
+// LevelMap is a map stores NvidiaNode on each level.
 type LevelMap map[nvml.GpuTopologyLevel][]*NvidiaNode
 
-//NvidiaTree represents a Nvidia GPU in a tree.
+// NvidiaTree represents a Nvidia GPU in a tree.
 type NvidiaTree struct {
 	sync.Mutex
 
@@ -64,7 +64,7 @@ func init() {
 	device.Register("nvidia", NewNvidiaTree)
 }
 
-//NewNvidiaTree returns a new NvidiaTree.
+// NewNvidiaTree returns a new NvidiaTree.
 func NewNvidiaTree(cfg *config.Config) device.GPUTree {
 	tree := newNvidiaTree(cfg)
 
@@ -84,10 +84,11 @@ func newNvidiaTree(cfg *config.Config) *NvidiaTree {
 	return tree
 }
 
-//Init a NvidiaTree.
-//Will try to use nvml first, fallback to input string if
-//parseFromLibrary() failed.
+// Init a NvidiaTree.
+// Will try to use nvml first, fallback to input string if
+// parseFromLibrary() failed.
 func (t *NvidiaTree) Init(input string) {
+	// 尝试调用nvml库
 	err := t.parseFromLibrary()
 	if err == nil {
 		t.realMode = true
@@ -95,25 +96,22 @@ func (t *NvidiaTree) Init(input string) {
 	}
 
 	klog.V(2).Infof("Can't use nvidia library, err %s. Use text parser", err)
-
-	err = t.parseFromString(input)
-
-	if err != nil {
+	// 调用nvml失败则从input中解析读取
+	if err := t.parseFromString(input); err != nil {
 		klog.Fatalf("Can not initialize nvidia tree, err %s", err)
 	}
 }
 
-//Update NvidiaTree by info getting from GPU devices.
-//Return immediately if real GPU device is not available.
+// Update NvidiaTree by info getting from GPU devices.
+// Return immediately if real GPU device is not available.
 func (t *NvidiaTree) Update() {
 	if !t.realMode {
 		return
 	}
 
-	if err := nvml.Init(); err != nil {
+	if rs := nvml.Init(); rs != nvml.SUCCESS {
 		return
 	}
-
 	defer nvml.Shutdown()
 
 	klog.V(4).Infof("Update device information")
@@ -168,59 +166,72 @@ func (t *NvidiaTree) addNode(node *NvidiaNode) {
 }
 
 func (t *NvidiaTree) parseFromLibrary() error {
-	if err := nvml.Init(); err != nil {
-		return err
+	// 初始化nvml
+	if rs := nvml.Init(); rs != nvml.SUCCESS {
+		return errors.New(nvml.ErrorString(rs))
 	}
 
 	defer nvml.Shutdown()
-
-	num, err := nvml.DeviceGetCount()
-	if err != nil {
-		return err
+	// 获取设备数
+	num, rs := nvml.DeviceGetCount()
+	if rs != nvml.SUCCESS {
+		return errors.New(nvml.ErrorString(rs))
 	}
 
 	klog.V(2).Infof("Detect %d gpu cards", num)
 
 	nodes := make(LevelMap)
 	t.leaves = make([]*NvidiaNode, num)
-
-	for i := 0; i < int(num); i++ {
-		dev, _ := nvml.DeviceGetHandleByIndex(uint(i))
-		_, _, totalMem, _ := dev.DeviceGetMemoryInfo()
-		pciInfo, _ := dev.DeviceGetPciInfo()
-		minorID, _ := dev.DeviceGetMinorNumber()
-		uuid, _ := dev.DeviceGetUUID()
-
+	// 装填nvidia node 信息
+	for i := 0; i < num; i++ {
+		// 更具设备index获取设备
+		dev, _ := nvml.DeviceGetHandleByIndex(i)
+		// 获取设备内存使用信息
+		memInfo, _ := dev.GetMemoryInfo_v2()
+		// 获取设备pci信息
+		pciInfo, _ := dev.GetPciInfo()
+		// 获取设备编号
+		minorID, _ := dev.GetMinorNumber()
+		// 获取设备uuid
+		uuid, _ := dev.GetUUID()
+		// 设备名称/显卡类型
+		name, _ := dev.GetName()
+		// 创建NvidiaNode
 		n := t.allocateNode(i)
+		// vcudaCores初始化100
 		n.AllocatableMeta.Cores = HundredCore
-		n.AllocatableMeta.Memory = int64(totalMem)
-		n.Meta.TotalMemory = totalMem
-		n.Meta.BusId = pciInfo.BusID
-		n.Meta.MinorID = int(minorID)
+		// 初始化设备总内存
+		n.AllocatableMeta.Memory = int64(memInfo.Total)
+		n.Meta.TotalMemory = memInfo.Total
+		n.Meta.BusId = B2S(pciInfo.BusId[:])
+		n.Meta.MinorID = minorID
 		n.Meta.UUID = uuid
-
+		n.Meta.Name = name
 		t.addNode(n)
 	}
-
-	for cardA := uint(0); cardA < num; cardA++ {
+	// 装填设备拓扑信息，用于多设备分配最近的
+	for cardA := 0; cardA < num; cardA++ {
+		// 获取设备a
 		devA, _ := nvml.DeviceGetHandleByIndex(cardA)
 		for cardB := cardA + 1; cardB < num; cardB++ {
+			// 获取设备b
 			devB, _ := nvml.DeviceGetHandleByIndex(cardB)
-			ntype, err := nvml.DeviceGetTopologyCommonAncestor(devA, devB)
-			if err != nil {
-				return err
+			// 获取设备a、设备b的拓扑公共祖先
+			ntype, rs := nvml.DeviceGetTopologyCommonAncestor(devA, devB)
+			if rs != nvml.SUCCESS {
+				return errors.New(nvml.ErrorString(rs))
 			}
 
-			multi, err := devA.DeviceGetMultiGpuBoard()
-			if err != nil {
-				return err
+			multi, rs := devA.GetMultiGpuBoard()
+			if rs != nvml.SUCCESS {
+				return errors.New(nvml.ErrorString(rs))
 			}
 
 			if multi > 0 && ntype == nvml.TOPOLOGY_INTERNAL {
 				ntype = nvml.TOPOLOGY_SINGLE
 			}
 
-			if newNode := t.join(nodes, ntype, int(cardA), int(cardB)); newNode != nil {
+			if newNode := t.join(nodes, ntype, cardA, cardB); newNode != nil {
 				klog.V(2).Infof("New node, type %d, mask %b", int(ntype), newNode.Mask)
 				nodes[ntype] = append(nodes[ntype], newNode)
 			}
@@ -401,7 +412,7 @@ func (t *NvidiaTree) join(nodes LevelMap, ntype nvml.GpuTopologyLevel, indexA, i
 	return newNode
 }
 
-//Available returns number of available leaves of this tree.
+// Available returns number of available leaves of this tree.
 func (t *NvidiaTree) Available() int {
 	t.Lock()
 	defer t.Unlock()
@@ -409,10 +420,10 @@ func (t *NvidiaTree) Available() int {
 	return t.root.Available()
 }
 
-//MarkFree updates a NvidiaNode by freeing request cores and memory.
-//If request cores < HundredCore, plus available cores and memory with request value.
-//If request cores >= HundredCore, set available cores and memory to total,
-//and update mask of all parents of this node.
+// MarkFree updates a NvidiaNode by freeing request cores and memory.
+// If request cores < HundredCore, plus available cores and memory with request value.
+// If request cores >= HundredCore, set available cores and memory to total,
+// and update mask of all parents of this node.
 func (t *NvidiaTree) MarkFree(node *NvidiaNode, util int64, memory int64) {
 	t.Lock()
 	defer t.Unlock()
@@ -470,10 +481,10 @@ func (t *NvidiaTree) freeNode(n *NvidiaNode) {
 	}
 }
 
-//MarkOccupied updates a NvidiaNode by adding request cores and memory.
-//Mask of all parents of this node will be updated.
-//If request cores < HundredCore, minus available cores and memory with request value.
-//If request cores >= HundredCore, set available cores and memory to 0,
+// MarkOccupied updates a NvidiaNode by adding request cores and memory.
+// Mask of all parents of this node will be updated.
+// If request cores < HundredCore, minus available cores and memory with request value.
+// If request cores >= HundredCore, set available cores and memory to 0,
 func (t *NvidiaTree) MarkOccupied(node *NvidiaNode, util int64, memory int64) {
 	t.Lock()
 	defer t.Unlock()
@@ -517,22 +528,38 @@ func (t *NvidiaTree) occupyNode(n *NvidiaNode) {
 	}
 }
 
-//Leaves returns leaves of tree
+// Leaves returns leaves of tree
 func (t *NvidiaTree) Leaves() []*NvidiaNode {
 	return t.leaves
 }
 
-//Total returns count of leaves
+// Leaves returns leaves of tree
+func (t *NvidiaTree) GetLeaveMaxTotalMemory() uint64 {
+	maxTotalMemory := uint64(0)
+	for _, node := range t.leaves {
+		maxTotalMemory = Max(maxTotalMemory, node.Meta.TotalMemory)
+	}
+	return maxTotalMemory
+}
+
+func Max(a, b uint64) uint64 {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
+// Total returns count of leaves
 func (t *NvidiaTree) Total() int {
 	return len(t.leaves)
 }
 
-//Root returns root node of tree
+// Root returns root node of tree
 func (t *NvidiaTree) Root() *NvidiaNode {
 	return t.root
 }
 
-//Query tries to find node by name, return nil if not found
+// Query tries to find node by name, return nil if not found
 func (t *NvidiaTree) Query(name string) *NvidiaNode {
 	n, ok := t.query[name]
 	if !ok {
@@ -543,7 +570,7 @@ func (t *NvidiaTree) Query(name string) *NvidiaNode {
 	return n
 }
 
-//PrintGraph returns the details of tree as string
+// PrintGraph returns the details of tree as string
 func (t *NvidiaTree) PrintGraph() string {
 	var (
 		buf bytes.Buffer
@@ -561,21 +588,23 @@ func (t *NvidiaTree) updateNode(idx int) *NvidiaNode {
 	nvml.Init()
 	defer nvml.Shutdown()
 
-	dev, _ := nvml.DeviceGetHandleByIndex(uint(idx))
-	pids, _ := dev.DeviceGetComputeRunningProcesses(MaxProcess)
-	util, _ := dev.DeviceGetAverageGPUUsage(t.samplePeriod)
+	dev, _ := nvml.DeviceGetHandleByIndex(idx)
+	lastUtilizationTimestamp := uint64(time.Now().Add(-1 * t.samplePeriod).UnixMicro())
+	processes, _ := dev.GetProcessUtilization(lastUtilizationTimestamp)
+
+	//proceInfo, _ := dev.GetComputeRunningProcesses()
+	//util, _ := dev.GetAverageGPUUsage(t.samplePeriod)
 
 	node := t.leaves[idx]
 
 	node.Meta.Pids = make([]uint, 0)
 	node.Meta.UsedMemory = 0
-	node.Meta.Utilization = util
 
-	for _, pid := range pids {
-		node.Meta.Pids = append(node.Meta.Pids, pid.Pid)
-		node.Meta.UsedMemory += pid.UsedGPUMemory
+	for _, process := range processes {
+		node.Meta.Pids = append(node.Meta.Pids, uint(process.Pid))
+		node.Meta.UsedMemory += uint64(process.MemUtil)
+		node.Meta.Utilization += uint(process.SmUtil)
 	}
-
 	return node
 }
 
@@ -624,23 +653,24 @@ func resetGPUFeature(node *NvidiaNode, realMode bool) error {
 		return nil
 	}
 
-	if err := nvml.Init(); err != nil {
-		return err
+	if rs := nvml.Init(); rs != nvml.SUCCESS {
+		return errors.New(nvml.ErrorString(rs))
 	}
 
 	defer nvml.Shutdown()
 
 	// GPU in the real world has a BusId
 	if len(node.Meta.BusId) > 0 {
-		dev, _ := nvml.DeviceGetHandleByIndex(uint(node.Meta.ID))
-		err := dev.DeviceSetComputeMode(nvml.COMPUTEMODE_DEFAULT)
-		if err != nil {
+		dev, _ := nvml.DeviceGetHandleByIndex(node.Meta.ID)
+		if rs := dev.SetComputeMode(nvml.COMPUTEMODE_DEFAULT); rs != nvml.SUCCESS {
+			err := errors.New(nvml.ErrorString(rs))
 			klog.V(3).Infof("can't set compute mode to default for %s, %v", node.Meta.BusId, err)
 			return err
 		}
 
-		curMode, _, err := dev.DeviceGetEccMode()
-		if err != nil {
+		curMode, _, rs := dev.GetEccMode()
+		if rs != nvml.SUCCESS {
+			err := errors.New(nvml.ErrorString(rs))
 			// If we got Not Supported error, that means this GPU card is not enabled for ECC
 			if strings.Contains(err.Error(), "Not Supported") {
 				node.pendingReset = false
@@ -651,12 +681,14 @@ func resetGPUFeature(node *NvidiaNode, realMode bool) error {
 			return err
 		}
 
-		if curMode {
-			if err = dev.DeviceClearEccErrorCounts(nvml.VOLATILE_ECC); err != nil {
+		if curMode == nvml.FEATURE_ENABLED {
+			if rs = dev.ClearEccErrorCounts(nvml.VOLATILE_ECC); rs != nvml.SUCCESS {
+				err := errors.New(nvml.ErrorString(rs))
 				klog.V(3).Infof("can't clear volatile ecc for %s, %v", node.Meta.BusId, err)
 				return err
 			}
-			if err = dev.DeviceClearEccErrorCounts(nvml.AGGREGATE_ECC); err != nil {
+			if rs = dev.ClearEccErrorCounts(nvml.AGGREGATE_ECC); rs != nvml.SUCCESS {
+				err := errors.New(nvml.ErrorString(rs))
 				klog.V(3).Infof("can't clear volatile ecc for %s, %v", node.Meta.BusId, err)
 				return err
 			}

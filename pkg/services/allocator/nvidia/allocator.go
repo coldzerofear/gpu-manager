@@ -20,6 +20,7 @@ package nvidia
 import (
 	"encoding/json"
 	"fmt"
+	"k8s.io/apimachinery/pkg/selection"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"tkestack.io/gpu-manager/pkg/utils/nodelock"
 
 	nveval "tkestack.io/gpu-manager/pkg/algorithm/nvidia"
 	"tkestack.io/gpu-manager/pkg/config"
@@ -64,7 +66,7 @@ func init() {
 	allocator.Register("nvidia_test", NewNvidiaTopoAllocatorForTest)
 }
 
-//NvidiaTopoAllocator is an allocator for Nvidia GPU
+// NvidiaTopoAllocator is an allocator for Nvidia GPU
 type NvidiaTopoAllocator struct {
 	sync.Mutex
 
@@ -101,7 +103,7 @@ var (
 	waitTimeout                          = 10 * time.Second
 )
 
-//NewNvidiaTopoAllocator returns a new NvidiaTopoAllocator
+// NewNvidiaTopoAllocator returns a new NvidiaTopoAllocator
 func NewNvidiaTopoAllocator(config *config.Config,
 	tree device.GPUTree,
 	k8sClient kubernetes.Interface,
@@ -112,25 +114,26 @@ func NewNvidiaTopoAllocator(config *config.Config,
 	if err != nil {
 		klog.Fatalf("Failed to create checkpoint manager due to %s", err.Error())
 	}
+	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 	alloc := &NvidiaTopoAllocator{
 		tree:              _tree,
 		config:            config,
 		evaluators:        make(map[string]Evaluator),
 		allocatedPod:      cache.NewAllocateCache(),
 		k8sClient:         k8sClient,
-		queue:             workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		queue:             queue,
 		stopChan:          make(chan struct{}),
 		checkpointManager: cm,
 		responseManager:   responseManager,
 	}
-
 	// Load kernel module if it's not loaded
 	alloc.loadModule()
 
 	// Initialize evaluator
-	alloc.initEvaluator(_tree)
+	alloc.initEvaluator(_tree, k8sClient, config)
 
 	// Read extra config if it's given
+	// 加载额外的配置文件
 	alloc.loadExtraConfig(config.ExtraConfigPath)
 
 	// Process allocation results in another goroutine
@@ -145,8 +148,8 @@ func NewNvidiaTopoAllocator(config *config.Config,
 	return alloc
 }
 
-//NewNvidiaTopoAllocatorForTest returns a new NvidiaTopoAllocator
-//with fake docker client, just for testing.
+// NewNvidiaTopoAllocatorForTest returns a new NvidiaTopoAllocator
+// with fake docker client, just for testing.
 func NewNvidiaTopoAllocatorForTest(config *config.Config,
 	tree device.GPUTree,
 	k8sClient kubernetes.Interface,
@@ -170,7 +173,7 @@ func NewNvidiaTopoAllocatorForTest(config *config.Config,
 	}
 
 	// Initialize evaluator
-	alloc.initEvaluator(_tree)
+	alloc.initEvaluator(_tree, k8sClient, config)
 
 	// Check allocation in another goroutine periodically
 	go alloc.checkAllocationPeriodically(alloc.stopChan)
@@ -212,24 +215,31 @@ func (ta *NvidiaTopoAllocator) recoverInUsed() {
 	ta.checkAllocation()
 }
 
+// 校验分配信息
 func (ta *NvidiaTopoAllocator) checkAllocation() {
 	klog.V(4).Infof("Checking allocation of pods on this node")
-	pods, err := getPodsOnNode(ta.k8sClient, ta.config.Hostname, "")
+	// 查询当前节点下 所有的 pod
+	pods, err := getPodsOnNode(ta.k8sClient, ta.config.Hostname, "", nil)
 	if err != nil {
 		klog.Infof("Failed to get pods on node due to %v", err)
 		return
 	}
 
 	for i, p := range pods {
+		// 过滤非gpu的容器
 		if !utils.IsGPURequiredPod(&p) {
 			continue
 		}
 		switch p.Status.Phase {
 		case v1.PodFailed, v1.PodPending:
+			// 当分配了gpu的pod处于挂起、运行失败时
+			// 校验容器状态是否需要删除，这个状态是 设备插件在 *启动容器阶段 校验容器失败后写入的信息
 			if utils.ShouldDelete(&pods[i]) {
+				// 删除掉由deployment 之类的控制器管理的pod，以便控制器重建
 				_ = ta.deletePodWithOwnerRef(&p)
 			}
 		case v1.PodRunning:
+
 			annotaionMap, err := ta.getReadyAnnotations(&pods[i], true)
 			if err != nil {
 				klog.Infof("failed to get ready annotations for pod %s", p.UID)
@@ -258,6 +268,7 @@ func (ta *NvidiaTopoAllocator) checkAllocation() {
 }
 
 func (ta *NvidiaTopoAllocator) checkAllocationPeriodically(quit chan struct{}) {
+	// 创建定时器：用于按周期去校验容器分配情况，触发一些额外的操作
 	ticker := time.NewTicker(ta.config.AllocationCheckPeriod)
 	for {
 		select {
@@ -290,10 +301,10 @@ func (ta *NvidiaTopoAllocator) loadExtraConfig(path string) {
 	}
 }
 
-func (ta *NvidiaTopoAllocator) initEvaluator(tree *nvtree.NvidiaTree) {
+func (ta *NvidiaTopoAllocator) initEvaluator(tree *nvtree.NvidiaTree, k8sClient kubernetes.Interface, config *config.Config) {
 	ta.evaluators["link"] = nveval.NewLinkMode(tree)
 	ta.evaluators["fragment"] = nveval.NewFragmentMode(tree)
-	ta.evaluators["share"] = nveval.NewShareMode(tree)
+	ta.evaluators["share"] = nveval.NewShareMode(tree, k8sClient, config)
 }
 
 func (ta *NvidiaTopoAllocator) loadModule() {
@@ -329,7 +340,8 @@ func (ta *NvidiaTopoAllocator) capacity() (devs []*pluginapi.Device) {
 			Health: pluginapi.Healthy,
 		}
 	}
-
+	// TODO根据缩放比来确定设备内存总量
+	totalMemory = int64(ta.config.DeviceMemoryScaling * float64(totalMemory))
 	totalMemoryBlocks := totalMemory / types.MemoryBlockSize
 	memoryDevices = make([]*pluginapi.Device, totalMemoryBlocks)
 	for i := int64(0); i < totalMemoryBlocks; i++ {
@@ -355,7 +367,11 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 	)
 
 	predicateMissed = !utils.IsGPUPredicatedPod(pod)
-	singleNodeMemory := int64(ta.tree.Leaves()[0].Meta.TotalMemory)
+	// TODO 默认index0 的设备内存总量为基准 , 改造为寻找设备内存最大值
+	// singleNodeMemory := int64(ta.tree.Leaves()[0].Meta.TotalMemory)
+
+	singleNodeMemory := int64(ta.tree.GetLeaveMaxTotalMemory())
+
 	for _, v := range req.DevicesIDs {
 		if strings.HasPrefix(v, types.VCoreAnnotation) {
 			needCores++
@@ -384,6 +400,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 	}
 	klog.V(2).Infof("Tree graph: %s", ta.tree.PrintGraph())
 
+	// 已分配过无需再次操作
 	if allocated {
 		klog.V(2).Infof("container %s of pod %s has already been allocated, get devices from cached instead", container.Name, pod.UID)
 		for _, d := range containerCache.Devices {
@@ -397,24 +414,34 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 
 		switch {
 		case needCores > nvtree.HundredCore:
+			// 请求的核心数大于一百: 多张卡 使用 linkMode
 			eval, ok := ta.evaluators["link"]
 			if !ok {
 				return nil, fmt.Errorf("can not find evaluator link")
 			}
+			// 请求的核心数不是100的倍数则报错
 			if needCores%nvtree.HundredCore > 0 {
 				return nil, fmt.Errorf("cores are greater than %d, must be multiple of %d", nvtree.HundredCore, nvtree.HundredCore)
 			}
-			nodes = eval.Evaluate(needCores, 0)
+			// 返回彼此连接开销最小的节点 比如分配两个最近的设备
+			nodes = eval.Evaluate(needCores, 0, pod)
 		case needCores == nvtree.HundredCore:
+			// 请求的核心等于100，整卡占用 使用 碎片模式 fragmentMode
 			eval, ok := ta.evaluators["fragment"]
 			if !ok {
 				return nil, fmt.Errorf("can not find evaluator fragment")
 			}
-			nodes = eval.Evaluate(needCores, 0)
+			// 返回具有最小可用内核的节点
+			nodes = eval.Evaluate(needCores, 0, pod)
 		default:
+			// 请求核心小于100时 使用共享模式
+
+			// 校验是否开启共享模式开关
 			if !ta.config.EnableShare {
 				return nil, fmt.Errorf("share mode is not enabled")
 			}
+
+			// 校验请求核心或者显存不为0
 			if needCores == 0 || needMemory == 0 {
 				return nil, fmt.Errorf("that cores or memory is zero is not permitted in share mode")
 			}
@@ -425,8 +452,11 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 			if !ok {
 				return nil, fmt.Errorf("can not find evaluator share")
 			}
-			nodes = eval.Evaluate(needCores, needMemory)
+			// 返回经过排序的具有最小可用内核的节点，以完成请求。
+			nodes = eval.Evaluate(needCores, needMemory, pod)
+			// 计算出的节点为0，没有可用节点
 			if len(nodes) == 0 {
+				// 在共享模式下当请求的内存大于单个设备的最大内存，抛出错误
 				if shareMode && needMemory > singleNodeMemory {
 					return nil, fmt.Errorf("request memory %d is larger than %d", needMemory, singleNodeMemory)
 				}
@@ -436,20 +466,26 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 
 			if !predicateMissed {
 				// get predicate node by annotation
+				// 获取容器index
 				containerIndex, err := utils.GetContainerIndexByName(pod, container.Name)
 				if err != nil {
 					return nil, err
 				}
 				var devStr string
+				// 拼接index 注解获取调度器阶段分配的设备id
 				if idxStr, ok := pod.ObjectMeta.Annotations[types.PredicateGPUIndexPrefix+strconv.Itoa(containerIndex)]; ok {
+					// 找到设备id
 					if _, err := strconv.Atoi(idxStr); err != nil {
 						return nil, fmt.Errorf("predicate idx %s invalid for pod %s ", idxStr, pod.UID)
 					}
+					// 拼接设备路径
 					devStr = types.NvidiaDevicePrefix + idxStr
+					//检查路径是否为有效的Nvidia GPU设备路径，无效则报错
 					if !utils.IsValidGPUPath(devStr) {
 						return nil, fmt.Errorf("predicate idx %s invalid", devStr)
 					}
 				} else {
+					// 当pod注解上没找到gpu设备id,则报错
 					return nil, fmt.Errorf("failed to find predicate idx for pod %s", pod.UID)
 				}
 
@@ -459,6 +495,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 				}
 
 				// check if we choose the same node as scheduler
+				// 检查设备插件是否选择了与调度器相同的节点
 				if predicateNode.MinorName() != nodes[0].MinorName() {
 					return nil, fmt.Errorf("Nvidia node mismatch for pod %s(%s), pick up:%s  predicate: %s",
 						pod.Name, container.Name, nodes[0].MinorName(), predicateNode.MinorName())
@@ -516,9 +553,11 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 	// check if all containers of pod has been allocated; set unfinishedPod if not
 	unfinished := false
 	for _, c := range pod.Spec.Containers {
+		// 过滤非gpu容器
 		if !utils.IsGPURequiredContainer(&c) {
 			continue
 		}
+		// 找到任然需要分配的容器
 		podCache := ta.allocatedPod.GetCache(string(pod.UID))
 		if podCache != nil {
 			if _, ok := podCache[c.Name]; !ok {
@@ -527,11 +566,13 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 			}
 		}
 	}
+	// 当没完全分配完毕，设置unfinishedPod，否则置为空
 	if unfinished {
 		ta.unfinishedPod = pod
 	} else {
 		ta.unfinishedPod = nil
 	}
+	// 将分配信息写入check point 文件
 	ta.writeCheckpoint()
 
 	// Append control device
@@ -561,6 +602,7 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 	// LD_LIBRARY_PATH
 	ctntResp.Envs["LD_LIBRARY_PATH"] = "/usr/local/nvidia/lib64"
 	for _, env := range container.Env {
+		// 当容器环境变量指定了使用32位库，LD_LIBRARY_PATH环境变量改为32位库路径
 		if env.Name == "compat32" && strings.ToLower(env.Value) == "true" {
 			ctntResp.Envs["LD_LIBRARY_PATH"] = "/usr/local/nvidia/lib"
 		}
@@ -570,12 +612,14 @@ func (ta *NvidiaTopoAllocator) allocateOne(pod *v1.Pod, container *v1.Container,
 	ctntResp.Envs["NVIDIA_VISIBLE_DEVICES"] = strings.Join(deviceList, ",")
 
 	if shareMode {
+		// 如果是共享模式，则mount修改后的vcuda库
 		ctntResp.Mounts = append(ctntResp.Mounts, &pluginapi.Mount{
 			ContainerPath: "/usr/local/nvidia",
 			HostPath:      types.DriverLibraryPath,
 			ReadOnly:      true,
 		})
 	} else {
+		// 如果是独占模式，则mount原nvidia的cuda库
 		ctntResp.Mounts = append(ctntResp.Mounts, &pluginapi.Mount{
 			ContainerPath: "/usr/local/nvidia",
 			HostPath:      types.DriverOriginLibraryPath,
@@ -610,26 +654,36 @@ func (ta *NvidiaTopoAllocator) requestForVCuda(podUID string) error {
 		PodUID: podUID,
 		Done:   make(chan error, 1),
 	}
+	// 将当前pod信息添加到 vcuda信号队列
+	// VCudaRequestsQueue 另一端接收到信号后，
+	// 会为这个pod 创建用于生成vcuda config的grpc服务
 	ta.config.VCudaRequestsQueue <- vcudaEvent
+	// 等待grpc服务的启动结果
 	return <-vcudaEvent.Done
 }
 
 func (ta *NvidiaTopoAllocator) recycle() {
+	// 获取全部 gpu设备的活动中的 pod
 	activePods := watchdog.GetActivePods()
-
+	// 已分配的pod uid
 	lastActivePodUids := sets.NewString()
+	// 全部活动中的pod uid
 	activePodUids := sets.NewString()
+	// 遍历已分配的pod
 	for _, uid := range ta.allocatedPod.Pods() {
+		// 装载pod uid
 		lastActivePodUids.Insert(uid)
 	}
+	// 遍历活动中的pod
 	for uid := range activePods {
+		// 装载pod uid
 		activePodUids.Insert(uid)
 	}
-
+	// 计算差值，已分配的 和 全部活动中的对比，找出 已经不再活动的 需要移除的pod uid
 	podsToBeRemoved := lastActivePodUids.Difference(activePodUids)
 
 	klog.V(5).Infof("Pods to be removed: %v", podsToBeRemoved.List())
-
+	// 将gpu占用释放
 	ta.freeGPU(podsToBeRemoved.List())
 }
 
@@ -637,70 +691,77 @@ func (ta *NvidiaTopoAllocator) freeGPU(podUids []string) {
 	for _, uid := range podUids {
 		for contName, info := range ta.allocatedPod.GetCache(uid) {
 			klog.V(2).Infof("Free %s(%s)", uid, contName)
-
+			// 遍历容器的设备
 			for _, devName := range info.Devices {
+				// 根据设备名找出 设备id
 				id, _ := utils.GetGPUMinorID(devName)
+				// MarkFree通过释放请求核心和内存来更新NvidiaNode。
 				ta.tree.MarkFree(&nvtree.NvidiaNode{
 					Meta: nvtree.DeviceMeta{
 						MinorID: id,
 					},
 				}, info.Cores, info.Memory)
 			}
-
+			// 移除容器信息
 			ta.responseManager.DeleteResp(uid, contName)
 		}
+		// 从以分配中删除该pod
 		ta.allocatedPod.Delete(uid)
+		// 如果要清理的pod是未完成的pod, 则将未完成pod变量重置为nil
 		if ta.unfinishedPod != nil && uid == string(ta.unfinishedPod.UID) {
 			klog.V(2).Infof("unfinished pod %s was deleted, update cached reference to nil", uid)
 			ta.unfinishedPod = nil
 		}
 	}
+	// 更新checkpoint
 	ta.writeCheckpoint()
 }
 
 // #lizard forgives
-//Allocate tries to allocate GPU node for each request
+// Allocate tries to allocate GPU node for each request
 func (ta *NvidiaTopoAllocator) Allocate(_ context.Context, reqs *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	ta.Lock()
 	defer ta.Unlock()
-
 	var (
 		reqCount           uint
 		candidatePod       *v1.Pod
 		candidateContainer *v1.Container
-		found              bool
+		// 记录是否找到当前调度的pod
+		found bool
 	)
+	resps := &pluginapi.AllocateResponse{}
 	if len(reqs.ContainerRequests) < 1 {
-		return nil, fmt.Errorf("empty container request")
+		return resps, fmt.Errorf("empty container request")
 	}
 
 	// k8s send allocate request for one container at a time
 	req := reqs.ContainerRequests[0]
-	resps := &pluginapi.AllocateResponse{}
 	reqCount = uint(len(req.DevicesIDs))
 
 	klog.V(4).Infof("Request GPU device: %s", strings.Join(req.DevicesIDs, ","))
 
 	ta.recycle()
 
+	// 查找容器，当有未完成的pod，则处理
 	if ta.unfinishedPod != nil {
 		candidatePod = ta.unfinishedPod
 		cache := ta.allocatedPod.GetCache(string(candidatePod.UID))
 		if cache == nil {
 			msg := fmt.Sprintf("failed to find pod %s in cache", candidatePod.UID)
 			klog.Infof(msg)
-			return nil, fmt.Errorf(msg)
+			return resps, fmt.Errorf(msg)
 		}
 		for i, c := range candidatePod.Spec.Containers {
+			// 跳过缓存中不存的容器
 			if _, ok := cache[c.Name]; ok {
 				continue
 			}
-
+			// 跳过非gpu的容器
 			if !utils.IsGPURequiredContainer(&c) {
 				continue
 			}
-
-			if reqCount != utils.GetGPUResourceOfContainer(&candidatePod.Spec.Containers[i], types.VCoreAnnotation) {
+			// 请求核心数和容器申请的数量不匹配则报错
+			if reqCount != utils.GetGPUResourceOfContainer(&c, types.VCoreAnnotation) {
 				msg := fmt.Sprintf("allocation request mismatch for pod %s, reqs %v", candidatePod.UID, reqs)
 				klog.Infof(msg)
 				return nil, fmt.Errorf(msg)
@@ -710,32 +771,43 @@ func (ta *NvidiaTopoAllocator) Allocate(_ context.Context, reqs *pluginapi.Alloc
 			break
 		}
 	} else {
+		// 找出需要分配gpu的pod、基于调度时间排序
 		pods, err := getCandidatePods(ta.k8sClient, ta.config.Hostname)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to find candidate pods due to %v", err)
 			klog.Infof(msg)
-			return nil, fmt.Errorf(msg)
+			nodelock.ReleaseNodeLock(ta.config.Hostname, ta.k8sClient)
+			// return nil, fmt.Errorf(msg)
+			return resps, err
 		}
 
 		for _, pod := range pods {
 			if found {
 				break
 			}
+
+			// 遍历pod下的容器
 			for i, c := range pod.Spec.Containers {
+				// 过滤掉非gpu的容器
 				if !utils.IsGPURequiredContainer(&c) {
 					continue
 				}
 				podCache := ta.allocatedPod.GetCache(string(pod.UID))
 				if podCache != nil {
+					// 跳过已分配过的容器
 					if _, ok := podCache[c.Name]; ok {
 						klog.Infof("container %s of pod %s has been allocate, continue to next", c.Name, pod.UID)
 						continue
 					}
 				}
+				// 找到请求核心相同的容器，代表找到了pod
 				if utils.GetGPUResourceOfContainer(&pod.Spec.Containers[i], types.VCoreAnnotation) == reqCount {
 					klog.Infof("Found candidate Pod %s(%s) with device count %d", pod.UID, c.Name, reqCount)
+					// 当卡前pod
 					candidatePod = pod
+					// 当前要分配的容器
 					candidateContainer = &pod.Spec.Containers[i]
+					// 标记找到
 					found = true
 					break
 				}
@@ -749,30 +821,71 @@ func (ta *NvidiaTopoAllocator) Allocate(_ context.Context, reqs *pluginapi.Alloc
 		for i := 0; i < int(vmemory); i++ {
 			req.DevicesIDs = append(req.DevicesIDs, types.VMemoryAnnotation)
 		}
-
 		resp, err := ta.allocateOne(candidatePod, candidateContainer, req)
 		if err != nil {
 			klog.Errorf(err.Error())
-			return nil, err
+			// 分配失败 写入分配失败 节点解锁
+			ta.PatchPodAllocationFailed(candidatePod)
+			return resps, err
 		}
 		if resp != nil {
 			resps.ContainerResponses = append(resps.ContainerResponses, resp)
 		}
 	} else {
+		// 没找到容器则报错
 		msg := fmt.Sprintf("candidate pod not found for request %v, allocation failed", reqs)
 		klog.Infof(msg)
-		return nil, fmt.Errorf(msg)
+		// 没找打容器 则解锁
+		if candidatePod == nil {
+			nodelock.ReleaseNodeLock(ta.config.Hostname, ta.k8sClient)
+		} else {
+			ta.PatchPodAllocationFailed(candidatePod)
+		}
+		return resps, fmt.Errorf(msg)
 	}
-
+	// 分配成功，无未完成分配的pod，写入分配完毕，节点解锁
+	if ta.unfinishedPod == nil {
+		ta.PatchPodAllocationSuccess(candidatePod)
+	}
 	return resps, nil
 }
 
-//ListAndWatch is not implement
+func (ta *NvidiaTopoAllocator) PatchPodAllocationFailed(pod *v1.Pod) {
+	labels := map[string]string{types.PodLabelDeviceBindPhase: string(types.DeviceBindFailed)}
+	patch := utils.NewPatchLabel(labels)
+	bytes, _ := json.Marshal(patch)
+	_, err := ta.k8sClient.CoreV1().Pods(pod.Namespace).
+		Patch(context.Background(), pod.Name, k8stypes.StrategicMergePatchType, bytes, metav1.PatchOptions{})
+	if err != nil {
+		klog.Infof("patch pod %v failed, %v", pod.Name, err)
+	}
+	err = nodelock.ReleaseNodeLock(ta.config.Hostname, ta.k8sClient)
+	if err != nil {
+		klog.Errorf("release lock failed:%v", err.Error())
+	}
+}
+
+func (ta *NvidiaTopoAllocator) PatchPodAllocationSuccess(pod *v1.Pod) {
+	labels := map[string]string{types.PodLabelDeviceBindPhase: string(types.DeviceBindSuccess)}
+	patch := utils.NewPatchLabel(labels)
+	bytes, _ := json.Marshal(patch)
+	_, err := ta.k8sClient.CoreV1().Pods(pod.Namespace).
+		Patch(context.Background(), pod.Name, k8stypes.StrategicMergePatchType, bytes, metav1.PatchOptions{})
+	if err != nil {
+		klog.Infof("patch pod %v failed, %v", pod.Name, err)
+	}
+	err = nodelock.ReleaseNodeLock(ta.config.Hostname, ta.k8sClient)
+	if err != nil {
+		klog.Errorf("release lock failed:%v", err.Error())
+	}
+}
+
+// ListAndWatch is not implement
 func (ta *NvidiaTopoAllocator) ListAndWatch(e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 	return fmt.Errorf("not implement")
 }
 
-//ListAndWatchWithResourceName send devices for request resource back to server
+// ListAndWatchWithResourceName send devices for request resource back to server
 func (ta *NvidiaTopoAllocator) ListAndWatchWithResourceName(resourceName string, e *pluginapi.Empty, s pluginapi.DevicePlugin_ListAndWatchServer) error {
 	devs := make([]*pluginapi.Device, 0)
 	for _, dev := range ta.capacity() {
@@ -781,9 +894,10 @@ func (ta *NvidiaTopoAllocator) ListAndWatchWithResourceName(resourceName string,
 		}
 	}
 
-	s.Send(&pluginapi.ListAndWatchResponse{Devices: devs})
+	_ = s.Send(&pluginapi.ListAndWatchResponse{Devices: devs})
 
 	// We don't send unhealthy state
+	// 不更新设备不健康状态
 	for {
 		time.Sleep(time.Second)
 	}
@@ -793,14 +907,22 @@ func (ta *NvidiaTopoAllocator) ListAndWatchWithResourceName(resourceName string,
 	return nil
 }
 
-//GetDevicePluginOptions returns empty DevicePluginOptions
+// GetPreferredAllocation从可用设备列表中返回要分配的首选设备集。
+// 由此产生的首选分配不能保证是设备管理器最终执行的分配。
+// 它只是为了在可能的情况下帮助设备管理器做出更明智的分配决定。
+func (ta *NvidiaTopoAllocator) GetPreferredAllocation(context.Context, *pluginapi.PreferredAllocationRequest) (*pluginapi.PreferredAllocationResponse, error) {
+	return &pluginapi.PreferredAllocationResponse{}, nil
+}
+
+// GetDevicePluginOptions returns empty DevicePluginOptions
 func (ta *NvidiaTopoAllocator) GetDevicePluginOptions(ctx context.Context, e *pluginapi.Empty) (*pluginapi.DevicePluginOptions, error) {
 	return &pluginapi.DevicePluginOptions{PreStartRequired: true}, nil
 }
 
-//PreStartContainer find the podUID by comparing request deviceids with deviceplugin
-//checkpoint data, then checks the validation of allocation of the pod.
-//Update pod annotation if check success, otherwise evict the pod.
+// PreStartContainer通过将请求设备ID与设备插件检查点数据进行比较来查找podUID，然后检查pod分配的有效性。 如果检查成功，则更新pod注释，否则将逐出pod。
+// PreStartContainer find the podUID by comparing request deviceids with deviceplugin
+// checkpoint data, then checks the validation of allocation of the pod.
+// Update pod annotation if check success, otherwise evict the pod.
 func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *pluginapi.PreStartContainerRequest) (*pluginapi.PreStartContainerResponse, error) {
 	ta.Lock()
 	defer ta.Unlock()
@@ -814,6 +936,7 @@ func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *plugi
 	)
 
 	// try to get podUID, containerName, vcore and vmemory from kubelet deviceplugin checkpoint file
+	// 尝试从kubelet设备插件checkpoint文件中获取podUID、containerName、vcore和vmemory
 	cp, err := utils.GetCheckpointData(ta.config.DevicePluginPath)
 	if err != nil {
 		msg := fmt.Sprintf("%s, failed to read from checkpoint file due to %v",
@@ -821,7 +944,9 @@ func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *plugi
 		klog.Infof(msg)
 		return nil, fmt.Errorf(msg)
 	}
+
 	for _, entry := range cp.PodDeviceEntries {
+		// 通过对比资源请求、和设备id分配来确定pod uid、容器名、vcuda分配数
 		if entry.ResourceName == types.VCoreAnnotation &&
 			utils.IsStringSliceEqual(req.DevicesIDs, entry.DeviceIDs) {
 			podUID = entry.PodUID
@@ -832,6 +957,7 @@ func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *plugi
 	}
 
 	for _, entry := range cp.PodDeviceEntries {
+		// 通过uid和容器名确定vmemory分配数
 		if entry.PodUID == podUID &&
 			entry.ContainerName == containerName &&
 			entry.ResourceName == types.VMemoryAnnotation {
@@ -839,23 +965,25 @@ func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *plugi
 			break
 		}
 	}
-
+	// 没找到podUID 或者 容器名 则报错
 	if podUID == "" || containerName == "" {
 		msg := fmt.Sprintf("%s, failed to get pod from deviceplugin checkpoint for PreStartContainer request %v",
 			types.PreStartContainerCheckErrMsg, req)
 		klog.Infof(msg)
 		return nil, fmt.Errorf(msg)
 	}
+	// 通过遍历本地缓存得到活动pod,从中根据pod uid找到具体的pod
 	pod, ok := watchdog.GetActivePods()[podUID]
 	if !ok {
 		msg := fmt.Sprintf("%s, failed to get pod %s in watchdog", types.PreStartContainerCheckErrMsg, podUID)
 		klog.Infof(msg)
 		return nil, fmt.Errorf(msg)
 	}
-
+	// 开始校验容器设备分配情况
 	err = ta.preStartContainerCheck(podUID, containerName, vcore, vmemory)
 	if err != nil {
 		klog.Infof(err.Error())
+		// 校验容器失败，将错误信息加入限速队列，使其异步更新pod错误状态描述
 		ta.queue.AddRateLimited(&allocateResult{
 			pod:     pod,
 			result:  ALLOCATE_FAIL,
@@ -866,6 +994,7 @@ func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *plugi
 	}
 
 	// allocation check ok, request for VCuda to setup vGPU environment
+	// 利用信道异步的为当前pod启动用于生成vcuda config的grpc服务，等待创建结果
 	err = ta.requestForVCuda(podUID)
 	if err != nil {
 		msg := fmt.Sprintf("failed to setup VCuda for pod %s(%s) due to %v", podUID, containerName, err)
@@ -874,6 +1003,8 @@ func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *plugi
 	}
 
 	// prestart check pass, update pod annotation
+	// 走到这一步象征设备分配彻底完成
+	// 将其加入限速队列，队列另一边异步更新pod分配状态
 	ar := &allocateResult{
 		pod:     pod,
 		result:  ALLOCATE_SUCCESS,
@@ -886,6 +1017,7 @@ func (ta *NvidiaTopoAllocator) PreStartContainer(ctx context.Context, req *plugi
 }
 
 func (ta *NvidiaTopoAllocator) preStartContainerCheck(podUID string, containerName string, vcore int64, vmemory int64) error {
+	// 从内部已分配缓存中查找,没找到则报错
 	cache := ta.allocatedPod.GetCache(podUID)
 	if cache == nil {
 		msg := fmt.Sprintf("%s, failed to get pod %s from allocatedPod cache",
@@ -893,19 +1025,21 @@ func (ta *NvidiaTopoAllocator) preStartContainerCheck(podUID string, containerNa
 		klog.Infof(msg)
 		return fmt.Errorf(msg)
 	}
-
+	// 缓存中没有容器信息，则报错
 	if c, ok := cache[containerName]; !ok {
 		msg := fmt.Sprintf("%s, failed to get container %s of pod %s from allocatedPod cache",
 			types.PreStartContainerCheckErrMsg, containerName, podUID)
 		klog.Infof(msg)
 		return fmt.Errorf(msg)
 	} else if c.Memory != vmemory*types.MemoryBlockSize || c.Cores != vcore {
+		// 缓存中记录分配的设备信息不正确，则报错
 		// request and cache mismatch, evict the pod
 		msg := fmt.Sprintf("%s, pod %s container %s requset mismatch from cache. req: vcore %d vmemory %d; cache: vcore %d vmemory %d",
 			types.PreStartContainerCheckErrMsg, podUID, containerName, vcore, vmemory*types.MemoryBlockSize, c.Cores, c.Memory)
 		klog.Infof(msg)
 		return fmt.Errorf(msg)
 	} else {
+		// 分配的设备不正确，则报错
 		devices := c.Devices
 		if (vcore < nvtree.HundredCore && len(devices) != 1) ||
 			(vcore >= nvtree.HundredCore && len(devices) != int(vcore/nvtree.HundredCore)) {
@@ -948,6 +1082,7 @@ func (ta *NvidiaTopoAllocator) processNextResult() bool {
 func (ta *NvidiaTopoAllocator) processResult(ar *allocateResult) error {
 	switch ar.result {
 	case ALLOCATE_SUCCESS:
+		// 获取要patch的注解：gpu分配结果、容器分配的gpu index
 		annotationMap, err := ta.getReadyAnnotations(ar.pod, true)
 		if err != nil {
 			msg := fmt.Sprintf("failed to get ready annotation of pod %s due to %s", ar.pod.UID, err.Error())
@@ -963,6 +1098,7 @@ func (ta *NvidiaTopoAllocator) processResult(ar *allocateResult) error {
 		close(ar.resChan)
 	case ALLOCATE_FAIL:
 		// free GPU devices that are already allocated to this pod
+		// 回收这个pod已分配的gpu
 		ta.freeGPU([]string{string(ar.pod.UID)})
 
 		ar.pod.Status = v1.PodStatus{
@@ -971,6 +1107,7 @@ func (ta *NvidiaTopoAllocator) processResult(ar *allocateResult) error {
 			Reason:  ar.reason,
 		}
 		ar.pod.Annotations = nil
+		// 更新pod状态信息, pod启动失败
 		err := ta.updatePodStatus(ar.pod)
 		if err != nil {
 			msg := fmt.Sprintf("failed to set status of pod %s to PodFailed due to %s", ar.pod.UID, err.Error())
@@ -1003,7 +1140,9 @@ func (ta *NvidiaTopoAllocator) getReadyAnnotations(pod *v1.Pod, assigned bool) (
 	}
 
 	annotationMap = make(map[string]string)
+	// 遍历pod的容器
 	for i, c := range pod.Spec.Containers {
+		// 过滤掉非gpu的容器
 		if !utils.IsGPURequiredContainer(&c) {
 			continue
 		}
@@ -1023,8 +1162,14 @@ func (ta *NvidiaTopoAllocator) getReadyAnnotations(pod *v1.Pod, assigned bool) (
 			devices[j] = strs[len(strs)-1]
 		}
 		predicateIndexStr := strings.Join(devices, ",")
+		// 容器分配的gpu设备index
 		annotationMap[types.PredicateGPUIndexPrefix+strconv.Itoa(i)] = predicateIndexStr
+		// TODO 添加注解
+		//for k, v := range GetAnnotation(i, devices) {
+		//	annotationMap[k] = v
+		//}
 	}
+	// gpu分配结果
 	annotationMap[types.GPUAssigned] = strconv.FormatBool(assigned)
 
 	return annotationMap, nil
@@ -1033,24 +1178,25 @@ func (ta *NvidiaTopoAllocator) getReadyAnnotations(pod *v1.Pod, assigned bool) (
 func (ta *NvidiaTopoAllocator) updatePodStatus(pod *v1.Pod) error {
 	klog.V(4).Infof("Try to update status of pod %s", pod.UID)
 
-	err := wait.PollImmediate(time.Second, waitTimeout, func() (bool, error) {
-		_, err := ta.k8sClient.CoreV1().Pods(pod.Namespace).UpdateStatus(pod)
-		if err == nil {
-			return true, nil
-		}
-		if utils.ShouldRetry(err) {
-			klog.Infof("update status of pod %s failed due to %v, try again", pod.UID, err)
-			newPod, err := ta.k8sClient.CoreV1().Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
-			if err != nil {
-				return false, err
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, waitTimeout, true,
+		func(ctx context.Context) (bool, error) {
+			_, err := ta.k8sClient.CoreV1().Pods(pod.Namespace).UpdateStatus(ctx, pod, metav1.UpdateOptions{})
+			if err == nil {
+				return true, nil
 			}
-			newPod.Status = pod.Status
-			pod = newPod
-			return false, nil
-		}
-		klog.V(4).Infof("Failed to update status of pod %s due to %v", pod.UID, err)
-		return false, err
-	})
+			if utils.ShouldRetry(err) {
+				klog.Infof("update status of pod %s failed due to %v, try again", pod.UID, err)
+				newPod, err := ta.k8sClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+				if err != nil {
+					return false, err
+				}
+				newPod.Status = pod.Status
+				pod = newPod
+				return false, nil
+			}
+			klog.V(4).Infof("Failed to update status of pod %s due to %v", pod.UID, err)
+			return false, err
+		})
 	if err != nil {
 		klog.Errorf("failed to update status of pod %s due to %v", pod.UID, err)
 		return err
@@ -1060,6 +1206,7 @@ func (ta *NvidiaTopoAllocator) updatePodStatus(pod *v1.Pod) error {
 }
 
 // delete pod if it is controlled by workloads like deployment, ignore naked pod
+// 如果pod由deployment等控制器控制，则删除它，忽略裸pod
 func (ta *NvidiaTopoAllocator) deletePodWithOwnerRef(pod *v1.Pod) error {
 	// free GPU devices that are already allocated to this pod
 	ta.freeGPU([]string{string(pod.UID)})
@@ -1073,17 +1220,18 @@ func (ta *NvidiaTopoAllocator) deletePodWithOwnerRef(pod *v1.Pod) error {
 		}
 		// delete the pod
 		klog.V(4).Infof("Try to delete pod %s", pod.UID)
-		err := wait.PollImmediate(time.Second, waitTimeout, func() (bool, error) {
-			err := ta.k8sClient.CoreV1().Pods(pod.Namespace).Delete(pod.Name, &metav1.DeleteOptions{})
-			if err == nil {
-				return true, nil
-			}
-			if utils.ShouldRetry(err) {
-				return false, nil
-			}
-			klog.V(4).Infof("Failed to delete pod %s due to %v", pod.UID, err)
-			return false, err
-		})
+		err := wait.PollUntilContextTimeout(context.Background(), time.Second, waitTimeout, true,
+			func(ctx context.Context) (bool, error) {
+				err := ta.k8sClient.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+				if err == nil {
+					return true, nil
+				}
+				if utils.ShouldRetry(err) {
+					return false, nil
+				}
+				klog.V(4).Infof("Failed to delete pod %s due to %v", pod.UID, err)
+				return false, err
+			})
 		if err != nil {
 			klog.Errorf("failed to delete pod %s due to %v", pod.UID, err)
 			return err
@@ -1108,17 +1256,20 @@ func patchPodWithAnnotations(client kubernetes.Interface, pod *v1.Pod, annotatio
 	}
 
 	payloadBytes, _ := json.Marshal(payload)
-	err := wait.PollImmediate(time.Second, waitTimeout, func() (bool, error) {
-		_, err := client.CoreV1().Pods(pod.Namespace).Patch(pod.Name, k8stypes.StrategicMergePatchType, payloadBytes)
-		if err == nil {
-			return true, nil
-		}
-		if utils.ShouldRetry(err) {
-			return false, nil
-		}
 
-		return false, err
-	})
+	err := wait.PollUntilContextTimeout(context.Background(), time.Second, waitTimeout, true,
+		func(ctx context.Context) (done bool, err error) {
+			_, err = client.CoreV1().Pods(pod.Namespace).Patch(ctx, pod.Name,
+				k8stypes.StrategicMergePatchType, payloadBytes, metav1.PatchOptions{})
+			if err == nil {
+				return true, nil
+			}
+			if utils.ShouldRetry(err) {
+				return false, nil
+			}
+			return false, err
+		},
+	)
 	if err != nil {
 		msg := fmt.Sprintf("failed to add annotation %v to pod %s due to %s", annotationMap, pod.UID, err.Error())
 		klog.Infof(msg)
@@ -1138,10 +1289,15 @@ func vDeviceAnnotationStr(nodes []*nvtree.NvidiaNode) string {
 
 func getCandidatePods(client kubernetes.Interface, hostname string) ([]*v1.Pod, error) {
 	candidatePods := []*v1.Pod{}
-	allPods, err := getPodsOnNode(client, hostname, string(v1.PodPending))
+	// 查找当前节点下 处于挂起状态的pod
+	requirement1, _ := labels.NewRequirement(types.PodLabelBindTime, selection.Exists, nil)
+	requirement2, _ := labels.NewRequirement(types.PodLabelDeviceBindPhase, selection.Equals, []string{string(types.DeviceBindAllocating)})
+	//allPods, err := getPodsOnNode(client, hostname, string(v1.PodPending), labels.NewSelector().Add(*requirement1, *requirement2))
+	allPods, err := getPodsOnNode(client, hostname, "", labels.NewSelector().Add(*requirement1, *requirement2))
 	if err != nil {
 		return candidatePods, err
 	}
+	// 找出请求gpu的、gpu还没分配完成的、无需删除的pod
 	for _, pod := range allPods {
 		current := pod
 		if utils.IsGPURequiredPod(&current) && !utils.IsGPUAssignedPod(&current) && !utils.ShouldDelete(&current) {
@@ -1154,42 +1310,50 @@ func getCandidatePods(client kubernetes.Interface, hostname string) ([]*v1.Pod, 
 			klog.Infof("candidate pod %s in ns %s with timestamp %d is found.",
 				pod.Name,
 				pod.Namespace,
-				utils.GetPredicateTimeOfPod(pod))
+				utils.GetBindTimeOfPod(pod))
 		}
 	}
-
-	return OrderPodsdByPredicateTime(candidatePods), nil
+	// 基于调度时间进行排序
+	return OrderPodsdByBindTime(candidatePods), nil
 }
 
-func getPodsOnNode(client kubernetes.Interface, hostname string, phase string) ([]v1.Pod, error) {
+func getPodsOnNode(client kubernetes.Interface, hostname string, phase string, labelsOpt labels.Selector) ([]v1.Pod, error) {
 	if len(hostname) == 0 {
-		hostname, _ = os.Hostname()
+		hostname = os.Getenv("NODE_NAME")
 	}
 	var (
-		selector fields.Selector
-		pods     []v1.Pod
+		fieldSelector fields.Selector
+		labelSelector labels.Selector
+		pods          []v1.Pod
 	)
 
 	if phase != "" {
-		selector = fields.SelectorFromSet(fields.Set{"spec.nodeName": hostname, "status.phase": phase})
+		fieldSelector = fields.SelectorFromSet(fields.Set{"spec.nodeName": hostname, "status.phase": phase})
 	} else {
-		selector = fields.SelectorFromSet(fields.Set{"spec.nodeName": hostname})
+		fieldSelector = fields.SelectorFromSet(fields.Set{"spec.nodeName": hostname})
+	}
+	if labelsOpt == nil {
+		labelSelector = labels.Everything()
+	} else {
+		labelSelector = labelsOpt
 	}
 	var (
 		podList *v1.PodList
 		err     error
 	)
-
-	err = wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
-		podList, err = client.CoreV1().Pods(v1.NamespaceAll).List(metav1.ListOptions{
-			FieldSelector: selector.String(),
-			LabelSelector: labels.Everything().String(),
-		})
-		if err != nil {
-			return false, err
-		}
-		return true, nil
-	})
+	err = wait.PollUntilContextTimeout(context.Background(), time.Second, time.Minute, true,
+		func(ctx context.Context) (bool, error) {
+			// 查找当前节点下的所有符合条件的pod
+			podList, err = client.CoreV1().Pods(v1.NamespaceAll).List(ctx, metav1.ListOptions{
+				FieldSelector: fieldSelector.String(),
+				LabelSelector: labelSelector.String(),
+			})
+			if err != nil {
+				return false, err
+			}
+			return true, nil
+		},
+	)
 	if err != nil {
 		return pods, fmt.Errorf("failed to get Pods on node %s because: %v", hostname, err)
 	}
@@ -1203,8 +1367,8 @@ func getPodsOnNode(client kubernetes.Interface, hostname string, phase string) (
 }
 
 // make the pod ordered by predicate time
-func OrderPodsdByPredicateTime(pods []*v1.Pod) []*v1.Pod {
-	newPodList := make(PodsOrderedByPredicateTime, 0, len(pods))
+func OrderPodsdByBindTime(pods []*v1.Pod) []*v1.Pod {
+	newPodList := make(PodsOrderedByBindTime, 0, len(pods))
 	for _, v := range pods {
 		newPodList = append(newPodList, v)
 	}
@@ -1212,17 +1376,31 @@ func OrderPodsdByPredicateTime(pods []*v1.Pod) []*v1.Pod {
 	return []*v1.Pod(newPodList)
 }
 
-type PodsOrderedByPredicateTime []*v1.Pod
+//type PodsOrderedByPredicateTime []*v1.Pod
+//
+//func (pods PodsOrderedByPredicateTime) Len() int {
+//	return len(pods)
+//}
+//
+//func (pods PodsOrderedByPredicateTime) Less(i, j int) bool {
+//	return utils.GetPredicateTimeOfPod(pods[i]) <= utils.GetPredicateTimeOfPod(pods[j])
+//}
+//
+//func (pods PodsOrderedByPredicateTime) Swap(i, j int) {
+//	pods[i], pods[j] = pods[j], pods[i]
+//}
 
-func (pods PodsOrderedByPredicateTime) Len() int {
+type PodsOrderedByBindTime []*v1.Pod
+
+func (pods PodsOrderedByBindTime) Len() int {
 	return len(pods)
 }
 
-func (pods PodsOrderedByPredicateTime) Less(i, j int) bool {
-	return utils.GetPredicateTimeOfPod(pods[i]) <= utils.GetPredicateTimeOfPod(pods[j])
+func (pods PodsOrderedByBindTime) Less(i, j int) bool {
+	return utils.GetBindTimeOfPod(pods[i]) <= utils.GetBindTimeOfPod(pods[j])
 }
 
-func (pods PodsOrderedByPredicateTime) Swap(i, j int) {
+func (pods PodsOrderedByBindTime) Swap(i, j int) {
 	pods[i], pods[j] = pods[j], pods[i]
 }
 

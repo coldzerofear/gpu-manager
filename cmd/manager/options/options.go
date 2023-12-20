@@ -18,21 +18,38 @@
 package options
 
 import (
+	"k8s.io/klog"
+	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/pflag"
 )
 
 const (
-	DefaultDriver                   = "nvidia"
-	DefaultQueryPort                = 5678
-	DefaultSamplePeriod             = 1
-	DefaultVirtualManagerPath       = "/etc/gpu-manager/vm"
-	DefaultAllocationCheckPeriod    = 30
-	DefaultCheckpointPath           = "/etc/gpu-manager/checkpoint"
-	DefaultContainerRuntimeEndpoint = "/var/run/dockershim.sock"
-	DefaultCgroupDriver             = "cgroupfs"
+	DefaultDriver                = "nvidia"
+	DefaultQueryPort             = 5678
+	DefaultSamplePeriod          = 1
+	DefaultDeviceMemoryScaling   = 1
+	DefaultVirtualManagerPath    = "/etc/gpu-manager/vm"
+	DefaultDeviceConfig          = "/etc/gpu-manager/config/config.json"
+	DefaultAllocationCheckPeriod = 30
+	DefaultCheckpointPath        = "/etc/gpu-manager/checkpoint"
+
+	DefaultKubeletConfig = "/var/lib/kubelet/config.yaml"
+
+	DockerShimRuntimeEndpoint = "/var/run/dockershim.sock"
+	DockerCriRuntimeEndpoint  = "/var/run/cri-dockerd.sock"
+	ContainerdRuntimeEndpoint = "/var/run/containerd/containerd.sock"
 )
+
+// TODO 不断添加兼容列表
+var ContainerRuntimeCompatibilityList = []string{
+	DockerShimRuntimeEndpoint,
+	DockerCriRuntimeEndpoint,
+	ContainerdRuntimeEndpoint,
+}
 
 // Options contains plugin information
 type Options struct {
@@ -49,6 +66,7 @@ type Options struct {
 	DevicePluginPath         string
 	EnableShare              bool
 	AllocationCheckPeriod    int
+	DeviceMemoryScaling      float64
 	CheckpointPath           string
 	ContainerRuntimeEndpoint string
 	CgroupDriver             string
@@ -65,12 +83,48 @@ func NewOptions() *Options {
 		SamplePeriod:             DefaultSamplePeriod,
 		VirtualManagerPath:       DefaultVirtualManagerPath,
 		AllocationCheckPeriod:    DefaultAllocationCheckPeriod,
+		DeviceMemoryScaling:      DefaultDeviceMemoryScaling,
 		CheckpointPath:           DefaultCheckpointPath,
-		ContainerRuntimeEndpoint: DefaultContainerRuntimeEndpoint,
-		CgroupDriver:             DefaultCgroupDriver,
+		ContainerRuntimeEndpoint: getDefaultRuntimeEndpoint(),
+		CgroupDriver:             getDefaultCgroupDriver(),
 		RequestTimeout:           time.Second * 5,
 		WaitTimeout:              time.Minute,
+		DevicePluginPath:         pluginapi.DevicePluginPath,
+		HostnameOverride:         os.Getenv("NODE_NAME"),
 	}
+}
+
+// TODO 兼容containerd配置, 当找不到 dockershim.sock, 默认值改为containerd.sock默认路径
+// https://github.com/tkestack/gpu-manager/commit/42599a6880513e6c683bbdd40022fffc8973a634
+func getDefaultRuntimeEndpoint() string {
+	for _, endpoint := range ContainerRuntimeCompatibilityList {
+		if _, err := os.Stat(endpoint); os.IsNotExist(err) {
+			klog.Warning(endpoint, " is not exist, skip it")
+		} else {
+			klog.Info("automatically recognized endpoint %s", endpoint)
+			return endpoint
+		}
+	}
+	return ""
+}
+
+func getDefaultCgroupDriver() string {
+	if fileContext, err := os.ReadFile(DefaultKubeletConfig); err != nil {
+		klog.Warning("read ", DefaultDeviceConfig, " file failed: %s", err.Error())
+	} else {
+		kubeletConfig := string(fileContext)
+		if strings.LastIndex(kubeletConfig, "cgroupDriver:") > 0 {
+			content := strings.ToLower(kubeletConfig)
+			if strings.Contains(content, "systemd") {
+				return "systemd"
+			}
+			if strings.Contains(content, "cgroupfs") {
+				return "cgroupfs"
+			}
+		}
+	}
+	klog.Warning("cgroup driver not automatically recognized")
+	return ""
 }
 
 // AddFlags add some commandline flags.
@@ -89,6 +143,7 @@ func (opt *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&opt.CheckpointPath, "checkpoint-path", opt.CheckpointPath, "configuration path for checkpoint store file")
 	fs.BoolVar(&opt.EnableShare, "share-mode", opt.EnableShare, "enable share mode allocation")
 	fs.IntVar(&opt.AllocationCheckPeriod, "allocation-check-period", opt.AllocationCheckPeriod, "allocation check period, unit second")
+	fs.Float64Var(&opt.DeviceMemoryScaling, "device-memory-scaling", opt.DeviceMemoryScaling, "define device memory scaling ratio")
 	fs.StringVar(&opt.ContainerRuntimeEndpoint, "container-runtime-endpoint", opt.ContainerRuntimeEndpoint, "container runtime endpoint")
 	fs.StringVar(&opt.CgroupDriver, "cgroup-driver", opt.CgroupDriver, "Driver that the kubelet uses to manipulate cgroups on the host.  "+
 		"Possible values: 'cgroupfs', 'systemd'")

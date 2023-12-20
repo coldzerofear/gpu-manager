@@ -18,7 +18,11 @@
 package nvidia
 
 import (
+	"fmt"
+	v1 "k8s.io/api/core/v1"
 	"sort"
+	"tkestack.io/gpu-manager/pkg/types"
+	"tkestack.io/gpu-manager/pkg/utils"
 
 	"k8s.io/klog"
 
@@ -32,26 +36,34 @@ type fragmentMode struct {
 //NewFragmentMode returns a new fragmentMode struct.
 //
 //Evaluate() of fragmentMode returns nodes with minimum available cores
-//which fullfil the request.
+//whiluate() of shareMode returns one node with minimum available cores which fullfil the request.Share mode means multiple application may share one GPU node which uses GPU more efficiently.ch fullfil the request.
 //
 //Fragment mode means to allocate cores on fragmented nodes first, which
 //helps link mode work better.
+
+// fragmentMode的Evaluate（）返回具有最小可用内核的节点，这些内核用于填充请求。
+// 碎片模式意味着首先在碎片节点上分配核心，这有助于link模式更好地工作。
 func NewFragmentMode(t *nvidia.NvidiaTree) *fragmentMode {
 	return &fragmentMode{t}
 }
 
-func (al *fragmentMode) Evaluate(cores int64, _ int64) []*nvidia.NvidiaNode {
+func (al *fragmentMode) Evaluate(cores int64, _ int64, pod *v1.Pod) []*nvidia.NvidiaNode {
 	var (
 		candidate = al.tree.Root()
 		next      *nvidia.NvidiaNode
-		sorter    = fragmentSort(nvidia.ByAvailable, nvidia.ByAllocatableMemory, nvidia.ByPids, nvidia.ByMinorID)
-		nodes     = make([]*nvidia.NvidiaNode, 0)
-		num       = int(cores / nvidia.HundredCore)
+		sorter    = fragmentSort(
+			nvidia.ByAvailable,
+			nvidia.ByAllocatableMemory,
+			nvidia.ByPids,
+			nvidia.ByMinorID,
+		)
+		nodes = make([]*nvidia.NvidiaNode, 0)
+		num   = int(cores / nvidia.HundredCore)
 	)
 
 	for next != candidate {
 		next = candidate
-
+		// 节点排序
 		sorter.Sort(candidate.Children)
 
 		for _, node := range candidate.Children {
@@ -65,13 +77,19 @@ func (al *fragmentMode) Evaluate(cores int64, _ int64) []*nvidia.NvidiaNode {
 		}
 	}
 
-	for _, n := range candidate.GetAvailableLeaves() {
+	for _, node := range candidate.GetAvailableLeaves() {
 		if num == 0 {
 			break
 		}
+		// TODO 添加设备类型指定功能
+		if !utils.CheckDeviceType(pod.Annotations, node.Meta.Name) {
+			klog.V(2).Infof("current gpu device %d name %s non compliant annotation[%s], skip device",
+				node.Meta.MinorID, node.Meta.Name, fmt.Sprintf("%s or %s", types.PodAnnotationUseGpuType, types.PodAnnotationUnUseGpuType))
+			continue
+		}
 
-		klog.V(2).Infof("Pick up %d mask %b", n.Meta.ID, n.Mask)
-		nodes = append(nodes, n)
+		klog.V(2).Infof("Pick up %d mask %b", node.Meta.ID, node.Mask)
+		nodes = append(nodes, node)
 		num--
 	}
 

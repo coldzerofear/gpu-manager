@@ -18,6 +18,7 @@
 package nvidia
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -87,7 +88,10 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 	//init allocator
 	k8sClient := fake.NewSimpleClientset()
 	alloc := initAllocator(tree, k8sClient)
-	alloc.initEvaluator(tree)
+	cfg := &config.Config{
+		Hostname: "k8s01",
+	}
+	alloc.initEvaluator(tree, k8sClient, cfg)
 
 	testCase := []struct {
 		PodName         string
@@ -174,7 +178,7 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 			}
 		}
 		if podCache.GetCache(string(pod.UID)) == nil {
-			k8sClient.CoreV1().Pods("test-ns").Create(pod)
+			k8sClient.CoreV1().Pods("test-ns").Create(context.Background(), pod, metav1.CreateOptions{})
 			podCache.Insert(string(pod.UID), testCase.PodName, &cache.Info{
 				Devices: []string{testCase.Device},
 				Cores:   100,
@@ -247,7 +251,10 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 	k8sClient := fake.NewSimpleClientset()
 	watchdog.NewPodCacheForTest(k8sClient)
 	alloc := initAllocator(tree, k8sClient)
-	alloc.initEvaluator(tree)
+	cfg := &config.Config{
+		Hostname: "k8s01",
+	}
+	alloc.initEvaluator(tree, k8sClient, cfg)
 
 	//create and allocate pod1
 	raw1 := podRawInfo{
@@ -320,7 +327,7 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 
 	//delete pod2
 	deleteOption := metav1.DeleteOptions{}
-	k8sClient.CoreV1().Pods("test-ns").Delete(raw2.Name, &deleteOption)
+	k8sClient.CoreV1().Pods("test-ns").Delete(context.Background(), raw2.Name, deleteOption)
 
 	//wait for watchdog to sync cache
 	time.Sleep(1 * time.Second)
@@ -387,7 +394,7 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 
 	//delete pod5
 	deleteOption = metav1.DeleteOptions{}
-	k8sClient.CoreV1().Pods("test-ns").Delete(raw5.Name, &deleteOption)
+	k8sClient.CoreV1().Pods("test-ns").Delete(context.Background(), raw5.Name, deleteOption)
 	time.Sleep(1 * time.Second)
 
 	//create and allocate pod7
@@ -458,7 +465,10 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 	k8sClient := fake.NewSimpleClientset()
 	watchdog.NewPodCacheForTest(k8sClient)
 	alloc := initAllocator(tree, k8sClient)
-	alloc.initEvaluator(tree)
+	cfg := &config.Config{
+		Hostname: "k8s01",
+	}
+	alloc.initEvaluator(tree, k8sClient, cfg)
 
 	//create and allocate pod1
 	raw1 := podRawInfo{
@@ -522,7 +532,10 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 	k8sClient := fake.NewSimpleClientset()
 	watchdog.NewPodCacheForTest(k8sClient)
 	alloc := initAllocator(tree, k8sClient)
-	alloc.initEvaluator(tree)
+	cfg := &config.Config{
+		Hostname: "k8s01",
+	}
+	alloc.initEvaluator(tree, k8sClient, cfg)
 
 	//create and allocate pod1
 	raw1 := podRawInfo{
@@ -592,17 +605,17 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 	//wait for background check
 	time.Sleep(3 * time.Second)
 
-	_, err = k8sClient.CoreV1().Pods("test-ns").Get(raw1.Name, metav1.GetOptions{})
+	_, err = k8sClient.CoreV1().Pods("test-ns").Get(context.Background(), raw1.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get pod1 due to %s", err.Error())
 	}
 
-	_, err = k8sClient.CoreV1().Pods("test-ns").Get(raw2.Name, metav1.GetOptions{})
+	_, err = k8sClient.CoreV1().Pods("test-ns").Get(context.Background(), raw2.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get pod2 due to %s", err.Error())
 	}
 
-	_, err = k8sClient.CoreV1().Pods("test-ns").Get(raw3.Name, metav1.GetOptions{})
+	_, err = k8sClient.CoreV1().Pods("test-ns").Get(context.Background(), raw3.Name, metav1.GetOptions{})
 	if err == nil {
 		t.Fatalf("pod3 should be deleted")
 	}
@@ -650,7 +663,10 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 	k8sClient := fake.NewSimpleClientset()
 	watchdog.NewPodCacheForTest(k8sClient)
 	alloc := initAllocator(tree, k8sClient)
-	alloc.initEvaluator(tree)
+	cfg := &config.Config{
+		Hostname: "k8s01",
+	}
+	alloc.initEvaluator(tree, k8sClient, cfg)
 
 	//create and allocate pod1
 	raw1 := podRawInfo{
@@ -700,7 +716,7 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 		t.Errorf("expected controller path to be %s, got %s,", ctrlPath, expectedCtrlPath)
 	}
 
-	k8sClient.CoreV1().Pods("test-ns").Delete(raw1.Name, &metav1.DeleteOptions{})
+	k8sClient.CoreV1().Pods("test-ns").Delete(context.Background(), raw1.Name, metav1.DeleteOptions{})
 	time.Sleep(1 * time.Second)
 
 	alloc.recycle()
@@ -713,7 +729,7 @@ GPU5     SOC     SOC     SOC     SOC     PIX      X
 
 func createAndAllocate(alloc *NvidiaTopoAllocator, client kubernetes.Interface, raw podRawInfo) (*pluginapi.AllocateResponse, error) {
 	var pod *v1.Pod
-	pod, _ = client.CoreV1().Pods("test-ns").Get(raw.Name, metav1.GetOptions{})
+	pod, _ = client.CoreV1().Pods("test-ns").Get(context.Background(), raw.Name, metav1.GetOptions{})
 	if pod == nil {
 		pod = createPod(client, raw)
 	}
@@ -731,7 +747,7 @@ func createAndAllocate(alloc *NvidiaTopoAllocator, client kubernetes.Interface, 
 			pod.Status.Phase = v1.PodFailed
 			pod.Status.Reason = types.UnexpectedAdmissionErrType
 			pod.Status.Message = err.Error()
-			_, _ = client.CoreV1().Pods("test-ns").UpdateStatus(pod)
+			_, _ = client.CoreV1().Pods("test-ns").UpdateStatus(context.Background(), pod, metav1.UpdateOptions{})
 			return resps, err
 		}
 		if resp != nil {
@@ -739,9 +755,9 @@ func createAndAllocate(alloc *NvidiaTopoAllocator, client kubernetes.Interface, 
 		}
 	}
 	pod.Status.Phase = v1.PodRunning
-	_, _ = client.CoreV1().Pods("test-ns").UpdateStatus(pod)
+	_, _ = client.CoreV1().Pods("test-ns").UpdateStatus(context.Background(), pod, metav1.UpdateOptions{})
 	_ = wait.Poll(time.Second, 5*time.Second, func() (bool, error) {
-		newPod, _ := client.CoreV1().Pods("test-ns").Get(pod.Name, metav1.GetOptions{})
+		newPod, _ := client.CoreV1().Pods("test-ns").Get(context.Background(), pod.Name, metav1.GetOptions{})
 		if newPod.Status.Phase == v1.PodRunning {
 			return true, nil
 		}
@@ -831,7 +847,7 @@ func createPod(client kubernetes.Interface, raw podRawInfo) *v1.Pod {
 		}
 		pod.Annotations[types.PredicateGPUIndexPrefix+strconv.Itoa(i)] = raw.Containers[i].PredicateIndexes
 	}
-	pod, _ = client.CoreV1().Pods("test-ns").Create(pod)
+	pod, _ = client.CoreV1().Pods("test-ns").Create(context.Background(), pod, metav1.CreateOptions{})
 
 	return pod
 }

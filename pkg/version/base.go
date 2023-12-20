@@ -20,5 +20,5 @@ package version
 var (
 	gitMajor  = "0"
 	gitMinor  = "1"
-	gitCommit = "$Format:%H$"
+	gitCommit = "f0669de638b024e3d9e5ecdcfdb239face4e52fd"
 )

@@ -1,6 +1,7 @@
 package response
 
 import (
+	"os"
 	"sync"
 
 	"k8s.io/klog"
@@ -34,11 +35,17 @@ func NewResponseManager() *responseManager {
 }
 
 func (m *responseManager) LoadFromFile(path string) error {
+	// kubelet_internal_checkpoint: 保存了device manager的状态, device manager重启的时候会从该文件中加载数据.
 	cp, err := utils.GetCheckpointData(path)
 	if err != nil {
+		// TODO 修复当kubelet还没生成checkpoints文件时，无法启动gpu-manager的问题 https://github.com/tkestack/gpu-manager/issues/148
+		if os.IsNotExist(err) {
+			klog.V(4).Infof("CheckpointData file does not exist, ignoring loading")
+			err = nil
+		}
 		return err
 	}
-
+	// 加载device manager checkpoints 文件后，将其装载到responseManager
 	for _, item := range cp.PodDeviceEntries {
 		// Only vcore resource has valid response data
 		if item.ResourceName == types.VCoreAnnotation {
