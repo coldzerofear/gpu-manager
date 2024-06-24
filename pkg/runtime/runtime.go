@@ -2,11 +2,12 @@ package runtime
 
 import (
 	"fmt"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/opencontainers/runc/libcontainer/cgroups"
 
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -37,6 +38,7 @@ type containerRuntimeManager struct {
 	runtimeName    string
 	requestTimeout time.Duration
 	client         criapi.RuntimeServiceClient
+	isCGroupV2     bool
 }
 
 var _ ContainerRuntimeInterface = (*containerRuntimeManager)(nil)
@@ -58,6 +60,7 @@ func NewContainerRuntimeManager(cgroupDriver, endpoint string, requestTimeout ti
 		cgroupDriver:   cgroupDriver,
 		client:         client,
 		requestTimeout: requestTimeout,
+		isCGroupV2:     cgroups.IsCgroup2UnifiedMode(),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), m.requestTimeout)
@@ -90,10 +93,12 @@ outer:
 		klog.Errorf("can't get cgroup parent, %v", err)
 		return nil, err
 	}
-
-	if !strings.HasPrefix(cgroupPath, types.CGROUP_BASE) {
+	if m.isCGroupV2 {
+		cgroupPath = filepath.Join(types.CGROUP_BASE, cgroupPath)
+	} else {
 		cgroupPath = filepath.Join(types.CGROUP_MEMORY, cgroupPath)
 	}
+
 	baseDir := filepath.Clean(cgroupPath)
 	// 校验cgroup文件路径是否存在
 	if _, err := os.Stat(baseDir); os.IsNotExist(err) && !oldVersion {
