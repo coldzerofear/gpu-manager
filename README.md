@@ -1,3 +1,5 @@
+Try using [vgpu-manager](https://github.com/coldzerofear/vgpu-manager) to solve the scheduling and allocation problems of VGPU. It will solve some existing problems and add new features that you may be interested in.
+
 # GPU Manager
 
 GPU管理器用于管理Kubernetes集群中的英伟达GPU设备。它实现了`DevicePlugin`接口。
